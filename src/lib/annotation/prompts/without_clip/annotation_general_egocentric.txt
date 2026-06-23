@@ -1,0 +1,123 @@
+# Video Annotation Task: General Egocentric Hand Action Description
+
+## Objective
+Provide a comprehensive 5-level language description for pre-cropped egocentric or close hand-centered videos of human hand-object interaction. These videos may show daily activities, tool use, object handling, cooking, cleaning, repair, assembly, organization, inspection, or other practical manipulation tasks.
+
+## Context
+- **Setting:** Homes, kitchens, desks, workshops, labs, retail spaces, outdoor work areas, and other real-world task environments.
+- **Perspective:** Ego-view or close hand-centered view focused on the hands and manipulated objects.
+- **Purpose:** Training data for robotic systems.
+- **Core Focus:** The visible hand action, the manipulated object, contact points, grasp type, spatial relationships, and the physical sequence needed to complete the task.
+
+---
+
+## Task Instructions
+
+Analyze the video clip and perform the following steps:
+
+### Step 1: Content Filtering (Hand-Action Status Check)
+- **Mark "status": "Invalid"** if the video shows:
+    - Walking, camera transition, or scene scanning with no meaningful hand-object interaction.
+    - Passive observation with no active manipulation.
+    - Hands resting, hanging, or only briefly entering the frame without acting on an object.
+    - Non-manipulation activities such as talking, reading, waiting, or looking around.
+    - A task where the main hand action cannot be identified because of severe occlusion, blur, or ambiguity.
+- **Mark "status": "Valid"** if the video shows active hand-object manipulation, such as picking, placing, opening, closing, pouring, wiping, folding, pressing, turning, cutting, fastening, arranging, inserting, removing, scanning a barcode/card/object, or operating an object.
+- If the main action is identifiable but partially occluded, mark `"status": "Valid"` and set `"is_good_quality": false`.
+
+### Step 2: Multi-Level Hand Action Instructions (For "Valid" only)
+
+- **Level 1 (Verb + Object):** Core task. Max 5 words. Example: "Open the drawer."
+- **Level 2 (Gist):** Concise summary of the hand action. Max 15 words.
+- **Level 3 (Object-Centric):** Describe the manipulated object, relevant parts, state, and spatial features. Max 30 words.
+- **Level 4 (Hand-Centric):** Specify left/right hand roles, grasp style, contact points, and coordination. Max 50 words.
+- **Level 5 (Dense Sequence):** Step-by-step physical breakdown. Max 100 words.
+    - Use spatial anchors such as "near the left edge," "above the bowl," "inside the slot," or "against the surface."
+    - Describe motion trajectories such as "lift upward," "slide forward," "rotate clockwise," "press downward," or "pull toward the body."
+    - Describe outcome state such as "fully seated," "opened," "aligned," "placed flat," "wiped clean," or "released."
+
+---
+
+## Strict Formatting & Quality Requirements
+
+- **Verb-first imperative:** Start with an action verb. **NO subjects**.
+- **Definite object references:** Use "the" for visible objects; avoid "a" or "an" in the generated instructions.
+- **No transitional words:** Omit "then", "next", "afterwards".
+- **Action Precision:** Use specific physical verbs such as "Grip," "Lift," "Place," "Open," "Close," "Pour," "Fold," "Wipe," "Press," "Turn," "Insert," "Remove," "Align," "Slide," "Scoop," "Cut," "Peel," "Tighten," or "Release" when possible.
+- **Avoid over-specialization:** Do not infer hidden intent, brand names, object identities, or materials unless clearly visible.
+
+### Execution Quality (is_good_quality)
+Set `"is_good_quality": true` ONLY if:
+1. The main hand-object action is completed or reaches a clear stable outcome.
+2. The movement is steady enough to understand the action.
+3. The relevant hand-object contact and manipulated object are clearly visible.
+
+---
+
+## Output Format
+Return a single JSON object. No markdown code fences. No extra text.
+For `"status": "Invalid"`, set `"is_good_quality": false` and return empty strings for all five levels.
+
+{
+  "status": "Valid/Invalid",
+  "is_good_quality": <true/false>,
+  "language_instructions": {
+    "level1": "<verb and object>",
+    "level2": "<concise summary>",
+    "level3": "<object-focused description>",
+    "level4": "<hand/object interaction details>",
+    "level5": "<dense physical step-by-step>"
+  }
+}
+
+---
+
+## Few-Shot Examples
+
+### Example A: Valid Completed Daily Manipulation
+Video content: A close hand-centered clip shows the right hand grasping the handle of a mug on a table, lifting it slightly, and placing it onto a coaster near the upper-right side of the frame.
+
+Expected output style:
+{
+  "status": "Valid",
+  "is_good_quality": true,
+  "language_instructions": {
+    "level1": "Place the mug.",
+    "level2": "Move the mug from the table onto the coaster.",
+    "level3": "Place the handled mug flat on the round coaster near the upper-right side of the table.",
+    "level4": "Grip the mug handle with the right fingers, lift the mug clear of the table, and guide the base over the coaster.",
+    "level5": "Grip the mug handle from the right side. Lift the mug upward from the table. Move the mug diagonally toward the upper-right coaster. Lower the mug until the base contacts the coaster. Release the handle once the mug sits flat."
+  }
+}
+
+### Example B: Valid but Low Quality
+Video content: A partially occluded clip shows the hands folding the edge of the cloth, but the final alignment is hidden by motion blur.
+
+Expected output style:
+{
+  "status": "Valid",
+  "is_good_quality": false,
+  "language_instructions": {
+    "level1": "Fold the cloth.",
+    "level2": "Fold the visible cloth edge inward.",
+    "level3": "Fold the near edge of the cloth toward the center while the final crease is partly obscured.",
+    "level4": "Pinch the cloth edge with both hands and pull the fabric inward, with the fingertips partly hidden during the crease.",
+    "level5": "Pinch the near cloth edge with both hands. Lift the edge slightly from the surface. Pull the edge inward toward the center of the cloth. Press the folded section downward where visible. Stop once the crease area becomes obscured."
+  }
+}
+
+### Example C: Invalid Non-Manipulation
+Video content: The camera pans across the room while the hands are out of frame and no object is manipulated.
+
+Expected output style:
+{
+  "status": "Invalid",
+  "is_good_quality": false,
+  "language_instructions": {
+    "level1": "",
+    "level2": "",
+    "level3": "",
+    "level4": "",
+    "level5": ""
+  }
+}

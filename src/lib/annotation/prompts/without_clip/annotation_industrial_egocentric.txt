@@ -1,0 +1,116 @@
+# Video Annotation Task: Industrial Egocentric Action Description
+
+## Objective
+Provide a comprehensive 5-level language description for pre-cropped first-person (egocentric) videos of factory operations. These videos capture industrial manipulation tasks like assembly, tool handling, and quality inspection to train robot foundation models for smart manufacturing.
+
+## Context
+- **Setting:** Factory assembly lines, maintenance benches, and industrial workstations.
+- **Perspective:** Ego-view (worker's viewpoint looking down at hands).
+- **Core Focus:** Tool-use precision, mechanical assembly, part handling, and industrial safety compliance.
+
+---
+
+## Task Instructions
+
+Analyze the industrial video clip and perform the following steps:
+
+### Step 1: Content Filtering (Industrial Status Check)
+- **Mark "status": "Invalid"** if the video shows:
+    - Walking between workstations or supply rooms.
+    - Passive observation with no hand activity.
+    - Hands resting on the workbench or hanging by the side.
+    - Non-manipulation tasks like reading a manual or talking to colleagues.
+- **Mark "status": "Valid"** if the video shows an active industrial manipulation (e.g., fastening a bolt, soldering, picking a part from a bin, operating a control panel).
+
+### Step 2: Industrial Multi-Level Instructions (For "Valid" only)
+
+- **Level 1 (Verb + Object):** Core industrial task. Max 5 words.
+- **Level 2 (Gist):** Concise summary of the industrial operation. Max 15 words.
+- **Level 3 (Object-Centric):** Describe specific industrial components and spatial features. Max 30 words.
+- **Level 4 (Hand-Centric):** Specify left/right hand roles and tool-handling style. Max 50 words.
+- **Level 5 (Dense Sequence):** Step-by-step physical breakdown. Max 100 words.
+
+---
+
+## Strict Formatting & Quality Requirements
+
+- **Verb-first imperative:** Start with an action verb. **NO subjects**.
+- **Definite articles only:** Use "the", never "a" or "an".
+- **No transitional words:** Omit "then", "next", "afterwards".
+- **Industrial Precision:** Use specific verbs like "Align," "Torque," "Insert," "Solder," "Scan," "Calibrate." when possible.
+
+### Execution Quality (is_good_quality)
+Set `"is_good_quality": true` ONLY if:
+1. The industrial task is completed successfully.
+2. The movement is professional and steady.
+3. The contact point between hand/tool and object is clearly visible.
+
+## Output Format
+Return a single JSON object. No markdown code fences. No extra text.
+For `"status": "Invalid"`, set `"is_good_quality": false` and return empty strings for all five levels.
+
+{
+  "status": "Valid/Invalid",
+  "is_good_quality": <true/false>,
+  "language_instructions": {
+    "level1": "<verb and object>",
+    "level2": "<concise summary>",
+    "level3": "<component-focused description>",
+    "level4": "<hand/tool interaction details>",
+    "level5": "<dense mechanical step-by-step>"
+  }
+}
+
+---
+
+## Few-Shot Examples
+
+### Example A: Valid Completed Industrial Operation
+Video content: A first-person factory clip shows the left hand holding a metal bracket against a fixture while the right hand drives a screw into the bracket with a powered screwdriver.
+
+Expected output style:
+{
+  "status": "Valid",
+  "is_good_quality": true,
+  "language_instructions": {
+    "level1": "Fasten the screw.",
+    "level2": "Secure the bracket to the fixture with the screwdriver.",
+    "level3": "Drive the screw through the metal bracket hole into the fixture until the head sits flush.",
+    "level4": "Stabilize the bracket with the left hand and align the powered screwdriver vertically with the right hand over the screw head.",
+    "level5": "Hold the bracket flat against the fixture with the left hand. Align the screwdriver bit with the screw head. Press the tool downward along the screw axis. Drive the screw into the fixture. Stop once the screw head sits flush against the bracket."
+  }
+}
+
+### Example B: Valid but Low Quality
+Video content: A worker scans a small component label, but the label and scanner tip are briefly blurred during contact.
+
+Expected output style:
+{
+  "status": "Valid",
+  "is_good_quality": false,
+  "language_instructions": {
+    "level1": "Scan the label.",
+    "level2": "Scan the component label with the handheld scanner.",
+    "level3": "Aim the scanner at the small label on the component while the barcode area is partly blurred.",
+    "level4": "Hold the component steady with the left hand and bring the scanner close with the right hand, with the tip briefly obscured.",
+    "level5": "Stabilize the component on the workstation with the left hand. Move the scanner toward the label with the right hand. Align the scanner tip over the label area. Hold the scanner close until the scan action completes or the tip becomes blurred. Keep the component steady."
+  }
+}
+
+### Example C: Invalid Industrial Context
+Video content: The camera moves down an assembly aisle while the worker walks between stations and no hand-object operation occurs.
+
+Expected output style:
+{
+  "status": "Invalid",
+  "is_good_quality": false,
+  "language_instructions": {
+    "level1": "",
+    "level2": "",
+    "level3": "",
+    "level4": "",
+    "level5": ""
+  }
+}
+
+---

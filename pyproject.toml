@@ -1,0 +1,48 @@
+# EgoSmith packaging.
+#
+# Scope of this file: make the first-party packages (lib, infiller, pypose,
+# scripts) importable via `pip install -e .` so you do not have to run from the
+# repo root or set PYTHONPATH.
+#
+# It deliberately does NOT pin the full runtime stack. torch / torch-scatter /
+# xformers / DPVO need CUDA-matched wheels or source builds, and the project
+# expects the single fixed `egosmith` conda env described in README.md. Install
+# dependencies with `scripts/setup/setup_env.sh` (which uses the CUDA-specific,
+# core, and Any4D requirements files); this packaging layer is only for import
+# resolution, not environment provisioning.
+#
+# NOTE: editable-install exposure of the PEP 420 namespace packages
+# (lib/, infiller/, thirdparty/) should be verified in a real env; running from
+# the repo root keeps working regardless.
+
+[project]
+name = "egosmith"
+version = "0.1.0"
+description = "EgoSmith — automated egocentric-video pipeline for dexterous-manipulation training data (world-space bimanual hands, metric 4D motion, multi-granularity language, QC)."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "license.txt" }
+
+[project.optional-dependencies]
+# Standalone rerun-based WebDataset viewer (separate, lighter env). The single-video
+# demo (demo.py) renders with OpenCV, which is already a core dependency, so it needs
+# no extra group here.
+rerun = [
+    "rerun-sdk==0.27.3",
+    "scipy",
+    "tqdm",
+]
+
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+# First-party packages live under src/ (src-layout). `scripts/` holds runnable
+# entrypoints, not an importable package, so it is not listed here. Vendored deps
+# (thirdparty/DPVO, thirdparty/Any4D) install via their own build; the HaWoR base
+# under src/lib + src/infiller + src/hawor is provided out-of-band from the
+# thirdparty/hawor_upstream submodule via scripts/setup/fetch_hawor_base.sh (see README).
+where = ["src"]
+include = ["lib*", "infiller*", "pypose*"]
+namespaces = true

@@ -1,0 +1,114 @@
+# Video Annotation Task: General Egocentric Action Segmentation and Description
+
+## Objective
+Segment the input egocentric or close hand-centered video into meaningful hand-object action clips. For each valid segment, provide a precise 5-level language description of the visible manipulation.
+
+## Content Scope
+The video may contain daily activities, tool use, object handling, cooking, cleaning, repair, assembly, organization, inspection, scanning, or other practical manipulation tasks.
+
+## Segmentation Rules
+- Create a segment only for active hand-object manipulation.
+- Exclude walking, camera transitions, scene scanning, passive observation, talking, reading, waiting, or hands resting without manipulating an object.
+- Start a new segment when the main manipulated object, manipulation goal, or action type changes.
+- Use non-overlapping segments.
+- Set segment times in seconds relative to the input video.
+- Prefer concise atomic segments with a clear physical outcome.
+- If the main action is identifiable but partially occluded, keep the segment and set `"is_good_quality": false`.
+- If no meaningful hand-object action exists, return an empty JSON array.
+
+## Language Instruction Levels
+For each segment:
+- **Level 1 (Verb + Object):** Core task. Max 5 words. Example: "Open the drawer."
+- **Level 2 (Gist):** Concise summary of the hand action. Max 15 words.
+- **Level 3 (Object-Centric):** Describe the manipulated object, relevant parts, state, and spatial features. Max 30 words.
+- **Level 4 (Hand-Centric):** Specify left/right hand roles, grasp style, contact points, and coordination. Max 50 words.
+- **Level 5 (Dense Sequence):** Step-by-step physical breakdown. Max 100 words.
+
+## Strict Requirements
+- Start every instruction with an action verb. Do not use subjects such as "I," "the person," "the worker," or "the hand."
+- Use "the" for visible objects; avoid "a" or "an" in generated instructions.
+- Omit "then", "next", "afterwards", and similar transitional words.
+- Use specific physical verbs such as "Grip," "Lift," "Place," "Open," "Close," "Pour," "Fold," "Wipe," "Press," "Turn," "Insert," "Remove," "Align," "Slide," "Scoop," "Cut," "Peel," "Tighten," or "Release" when possible.
+- Do not infer hidden intent, brand names, object identities, or materials unless clearly visible.
+
+## Quality Judgement
+Set `"is_good_quality": true` only if:
+1. The segment's main hand-object action is completed or reaches a clear stable outcome.
+2. The movement is steady enough to understand the action.
+3. The relevant hand-object contact and manipulated object are clearly visible.
+
+## Few-Shot Examples
+
+## Output Format
+Return a single JSON array. No markdown code fences. No extra text.
+
+[
+  {
+    "start": <float, seconds>,
+    "end": <float, seconds>,
+    "is_good_quality": <true/false>,
+    "language_instructions": {
+      "level1": "<verb and object>",
+      "level2": "<concise summary>",
+      "level3": "<object-focused description>",
+      "level4": "<hand/object interaction details>",
+      "level5": "<dense physical step-by-step>"
+    }
+  }
+]
+
+### Example A: Multiple Valid Segments
+Video content: The first part shows the right hand opening a drawer. A later part shows both hands placing a folded towel into the opened drawer. Idle time between the actions is not included.
+
+Expected output style:
+[
+  {
+    "start": 1.2,
+    "end": 3.8,
+    "is_good_quality": true,
+    "language_instructions": {
+      "level1": "Open the drawer.",
+      "level2": "Pull the drawer open from the cabinet.",
+      "level3": "Open the front drawer by pulling the handle outward until the storage space is exposed.",
+      "level4": "Hook the right fingers around the drawer handle and pull straight outward while the left hand stays clear.",
+      "level5": "Reach the right hand toward the drawer handle. Curl the fingers around the handle. Pull the drawer outward along the rails. Stop when the drawer opens enough to expose the inside space. Release the handle."
+    }
+  },
+  {
+    "start": 5.1,
+    "end": 8.4,
+    "is_good_quality": true,
+    "language_instructions": {
+      "level1": "Place the towel.",
+      "level2": "Place the folded towel inside the open drawer.",
+      "level3": "Lower the folded towel into the open drawer and align it flat against the drawer base.",
+      "level4": "Support the towel with both hands, guide it over the drawer opening, and release it once it lies flat.",
+      "level5": "Grip the folded towel along both side edges. Lift the towel above the drawer opening. Move the towel downward into the drawer. Align the towel with the drawer base. Release both edges once the towel lies flat inside."
+    }
+  }
+]
+
+### Example B: Valid but Low Quality Segment
+Video content: The hands pour liquid from a bottle into a cup, but the bottle opening is partially outside the frame near the end.
+
+Expected output style:
+[
+  {
+    "start": 0.6,
+    "end": 4.2,
+    "is_good_quality": false,
+    "language_instructions": {
+      "level1": "Pour the liquid.",
+      "level2": "Pour the liquid from the bottle into the cup.",
+      "level3": "Tilt the bottle above the cup while the bottle opening becomes partly cropped near the end.",
+      "level4": "Grip the bottle body with the right hand and steady the cup area with the left hand while the pouring contact is partly hidden.",
+      "level5": "Lift the bottle over the cup. Rotate the right wrist to tilt the bottle downward. Aim the opening toward the cup center where visible. Maintain the cup position with the left hand. Straighten the bottle once the pour slows near the cropped edge."
+    }
+  }
+]
+
+### Example C: No Valid Segment
+Video content: The camera scans a tabletop and the hands never manipulate an object.
+
+Expected output style:
+[]

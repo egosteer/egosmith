@@ -1,0 +1,12 @@
+Any4D
+Source: https://github.com/Any-4D/Any4D  (Jay Karhade et al.)
+Licensed under the Apache License, Version 2.0 — see LICENSE.txt.
+
+This is a vendored copy of Any4D redistributed as part of the EgoSmith release.
+The Any4D core (the `any4d` Python package) is included as-is from upstream.
+
+EgoSmith-specific integration/evaluation scripts that were kept under `scripts/` during
+development are NOT part of upstream Any4D and are excluded from this distribution.
+
+The bundled sub-component `any4d/external/MoGe` is licensed separately under the MIT License
+(© Microsoft Corporation) — see any4d/external/MoGe/LICENSE.

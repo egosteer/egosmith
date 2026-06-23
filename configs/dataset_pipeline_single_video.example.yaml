@@ -1,0 +1,31 @@
+# Minimal official pipeline config.
+# `output_root` is optional; if omitted it defaults to:
+# <video_dir>/<video_stem>.hawor_pipeline/
+
+video: /path/to/input.mp4
+
+# Optional:
+# output_root: /path/to/input.hawor_pipeline
+
+# Optional raw-video clipping before prepare. When enabled, the pipeline first
+# writes clipped MP4 files under <run_dir>/clips/videos, extracts frames from
+# those clips, and all later stages operate on the clipped videos.
+# clip:
+#   mode: heuristic  # none | heuristic
+#   config: src/lib/clip/heuristic_clip_config.yaml
+#   fallback_full_video: false
+#   # Optional small-run/debug knobs:
+#   # skip_frames: 15
+#   # output_root: /path/to/clipped_videos_root
+# Alternative API mode: semantic clipping plus annotation in one model call.
+# clip:
+#   mode: api
+#   prompt_file: src/lib/annotation/prompts/with_clip/annotation_general_clip.txt
+#   annotation_suffix: _qwen-annotation.json
+#   workers: 4
+
+# Optional annotation stage. If this block has no command, the default run skips
+# annotate and exports empty instruction/language fields.
+# annotation:
+#   command: >
+#     echo "Read {prepared_state} and write annotations to {annotation_root}"

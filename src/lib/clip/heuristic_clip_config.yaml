@@ -1,0 +1,58 @@
+paths:
+  # Optional detector checkpoint for the detection gate. Leave empty to rely on
+  # motion/ROI gates only.
+  model_path: ""
+
+runtime:
+  postfix_update_every: 10
+  gc_every: 32
+
+heuristic:
+  skip_frames: 15
+  decode_width: 448
+  decode_height: 256
+  fallback_full_video: false
+  # Optional resize for written clips. Omit or set null to keep source size.
+  output_size: null
+
+  gate_a:
+    # ROI / area aligned to the EgoSmith paper (App. Pre-Filtering Heuristics):
+    # hand bbox must intersect the lower-central region (horizontal [0.075,0.925],
+    # vertical [0.075,1.0]) and have area within [2%, 50%] of the image.
+    roi: [0.075, 0.075, 0.925, 1.00]
+    min_area_ratio: 0.02
+    max_area_ratio: 0.50
+    conf_thresh: 0.30
+    box_conf_thresh: 0.30
+    # Minimum number of qualifying hands inside the central ROI for the frame to
+    # count as a clearly-visible (two-handed) manipulation. Lower to 1 to also
+    # keep single-hand manipulations.
+    min_hands: 2
+
+  # The motion gate judges CAMERA STABILITY only. Whether a hand is present is
+  # handled separately by gate_a (the detector). Camera motion is measured as the
+  # displacement of a RANSAC-fitted global similarity model on its inliers (clean
+  # ego-motion, not contaminated by the moving foreground). A frame's camera is
+  # "stable" when that motion is within camera_motion_thresh * max(H, W) AND the
+  # inlier ratio is high enough.
+  gate_b:
+    flow_max_corners: 128
+    flow_quality_level: 0.01
+    flow_min_distance: 7
+    flow_block_size: 7
+    flow_min_tracked: 24
+    # camera_motion_thresh supersedes the legacy camera_disp_thresh (still read as
+    # a fallback). NOTE: thresholds here are starting points -- calibrate on
+    # production footage.
+    camera_motion_thresh: 0.2
+    # RANSAC reprojection tolerance (px on the decoded frame) for the global fit.
+    ransac_reproj_thresh: 3.0
+    # Below this inlier ratio the global fit is untrustworthy (scene dominated by
+    # motion/blur) -> camera treated as unstable.
+    min_inlier_ratio: 0.30
+
+  gate_c:
+    min_keep_sec: 2.0
+    # Cut a span only after this many consecutive failing samples; isolated
+    # failures below this run are tolerated (brief occlusion / jitter).
+    max_consecutive_invalid: 3

@@ -1,0 +1,6 @@
+[submodule "thirdparty/hawor_upstream"]
+	path = thirdparty/hawor_upstream
+	url = https://github.com/ThunderVVV/HaWoR
+[submodule "thirdparty/chumpy_upstream"]
+	path = thirdparty/chumpy_upstream
+	url = https://github.com/mattloper/chumpy

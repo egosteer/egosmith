@@ -1,0 +1,46 @@
+--- a/setup.py
++++ b/setup.py
+@@ -4,18 +4,19 @@
+ See LICENCE.txt for licensing and contact information.
+ """
+ 
+-from distutils.core import setup
+-try: # for pip >= 10
+-    from pip._internal.req import parse_requirements
+-except ImportError: # for pip <= 9.0.3
+-    from pip.req import parse_requirements
++from pathlib import Path
+ from runpy import run_path
++from setuptools import setup
++
++
++def get_install_requires():
++    req_path = Path(__file__).with_name("requirements.txt")
++    return [
++        line.strip()
++        for line in req_path.read_text().splitlines()
++        if line.strip() and not line.lstrip().startswith("#")
++    ]
+ 
+-install_reqs = parse_requirements('requirements.txt', session=False)
+-try:  # for pip < 20.1
+-    install_requires = [str(ir.req) for ir in install_reqs]
+-except AttributeError:  # for pip >= 20.1
+-    install_requires = [str(ir.requirement) for ir in install_reqs]
+ 
+ def get_version():
+     namespace = run_path('chumpy/version.py')
+@@ -29,7 +30,7 @@
+     url='https://github.com/mattloper/chumpy',
+     description='chumpy',
+     license='MIT',
+-    install_requires=install_requires,
++    install_requires=get_install_requires(),
+ 
+     # See https://pypi.python.org/pypi?%3Aaction=list_classifiers
+     classifiers=[
+@@ -56,4 +57,3 @@
+         'Operating System :: POSIX :: Linux'
+     ],
+ )
+-
