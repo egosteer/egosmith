@@ -24,6 +24,7 @@ _OFFICIAL_TOP_LEVEL_KEYS = {
     "build",
     "filter",
     "validation",
+    "lerobot",
 }
 
 _SINGLE_VIDEO_TOP_LEVEL_KEYS = {
@@ -38,6 +39,7 @@ _SINGLE_VIDEO_TOP_LEVEL_KEYS = {
     "validation",
     "infer",
     "adapter_config",
+    "lerobot",
 }
 
 _LEGACY_TOP_LEVEL_KEYS = {
@@ -152,6 +154,7 @@ def _apply_shared_nested_defaults(
     infer_cfg: dict,
     schema: str,
     migration_warnings: list[str] | None = None,
+    lerobot_cfg: dict | None = None,
 ) -> dict:
     adapter_name = dataset_cfg.get("adapter") or "buildai"
     dataset_cfg.setdefault("adapter", adapter_name)
@@ -162,6 +165,17 @@ def _apply_shared_nested_defaults(
         adapter_cfg.setdefault("stages", "1,2,3")
         adapter_cfg.setdefault("setup_decord", False)
         adapter_cfg.setdefault("clean_stage3_output", False)
+
+    # clip.mode api writes sidecars with clip.annotation_suffix; unless the user
+    # set build.annotation_suffix explicitly, build/filter/validate must read the
+    # same suffix or the written annotations are silently ignored.
+    clip_mode = str(clip_cfg.get("mode", "none")).strip().lower()
+    if (
+        build_cfg.get("annotation_suffix") is None
+        and clip_cfg.get("annotation_suffix")
+        and clip_mode in {"api", "api_annotation", "semantic_api"}
+    ):
+        build_cfg["annotation_suffix"] = str(clip_cfg["annotation_suffix"])
 
     for key, default in (
         ("require_annotation", False),
@@ -177,6 +191,9 @@ def _apply_shared_nested_defaults(
     ):
         build_cfg.setdefault(key, default)
 
+    # Remember whether filter.stages came from the user: the orchestrator swaps
+    # the default for the native stage list on native-feature manifests.
+    filter_stages_defaulted = filter_cfg.get("stages") is None
     for key, default in (
         ("stages", "detect_track,motion,slam,infiller"),
         ("workers", 8),
@@ -195,6 +212,15 @@ def _apply_shared_nested_defaults(
         ("dataset_sample_checks", 20),
     ):
         validation_cfg.setdefault(key, default)
+    # Without an annotation source (annotation.command, an API clip mode, or user-provided
+    # paths.annotation_root) every instruction is empty by construction, so validate must
+    # not reject the run for it.
+    validation_cfg.setdefault(
+        "allow_empty_instruction",
+        not annotation_cfg.get("command")
+        and not paths_cfg.get("annotation_root")
+        and clip_mode not in {"api", "api_annotation", "semantic_api"},
+    )
 
     clip_cfg.setdefault("mode", "none")
 
@@ -220,9 +246,11 @@ def _apply_shared_nested_defaults(
         "build": build_cfg,
         "filter": filter_cfg,
         "validation": validation_cfg,
+        "lerobot": dict(lerobot_cfg or {}),
         "_meta": {
             "schema": schema,
             "migration_warnings": list(migration_warnings or []),
+            "filter_stages_defaulted": filter_stages_defaulted,
         },
     }
 
@@ -240,6 +268,7 @@ def _normalize_nested_pipeline_config(raw: dict) -> dict:
     clip_cfg = _ensure_mapping(raw, "clip")
     adapter_cfg = _ensure_mapping(raw, "adapter_config")
     infer_cfg = _ensure_mapping(raw, "infer")
+    lerobot_cfg = _ensure_mapping(raw, "lerobot")
 
     return _apply_shared_nested_defaults(
         raw=raw,
@@ -254,6 +283,7 @@ def _normalize_nested_pipeline_config(raw: dict) -> dict:
         adapter_cfg=adapter_cfg,
         infer_cfg=infer_cfg,
         schema="nested",
+        lerobot_cfg=lerobot_cfg,
         migration_warnings=[
             "Nested dataset-pipeline configs remain supported, but the preferred first-party schema is now `video: ...` plus optional `output_root:`."
         ],
@@ -282,6 +312,7 @@ def _normalize_single_video_pipeline_config(raw: dict, *, base_dir: Path | None)
     filter_cfg = _ensure_mapping(raw, "filter")
     validation_cfg = _ensure_mapping(raw, "validation")
     infer_cfg = _ensure_mapping(raw, "infer")
+    lerobot_cfg = _ensure_mapping(raw, "lerobot")
 
     frames_root = output_root / "frames"
     stage_outputs_root = output_root / "stage_outputs"
@@ -311,7 +342,9 @@ def _normalize_single_video_pipeline_config(raw: dict, *, base_dir: Path | None)
 
     common_infer = _as_dict(infer_cfg.get("common"))
     common_infer.setdefault("gpus", _default_visible_gpus())
-    common_infer.setdefault("resume", True)
+    # `resume` is intentionally not defaulted here: the orchestrator resolves it
+    # (CLI > explicit infer.common.resume > top-level resume) and needs to know
+    # whether the user set it explicitly.
     common_infer.setdefault("depth_predict_all_frames", True)
     infer_cfg["common"] = common_infer
     slam_infer = _as_dict(infer_cfg.get("slam"))
@@ -326,7 +359,8 @@ def _normalize_single_video_pipeline_config(raw: dict, *, base_dir: Path | None)
     build_cfg.setdefault("target_fps", None)
 
     validation_cfg.setdefault("allow_empty_instruction", True)
-    validation_cfg.setdefault("require_depth", True)
+    # Depth is only exported when build.export_depth is on; requiring it otherwise always fails.
+    validation_cfg.setdefault("require_depth", bool(build_cfg["export_depth"]))
     validation_cfg.setdefault("depth_action_consistency", True)
 
     normalized = _apply_shared_nested_defaults(
@@ -345,6 +379,7 @@ def _normalize_single_video_pipeline_config(raw: dict, *, base_dir: Path | None)
         adapter_cfg=adapter_cfg,
         infer_cfg=infer_cfg,
         schema="single_video",
+        lerobot_cfg=lerobot_cfg,
     )
     normalized["_meta"].update(
         {

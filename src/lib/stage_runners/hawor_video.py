@@ -122,7 +122,15 @@ def load_hawor(checkpoint_path):
         model_cfg.MODEL.BACKBONE.TORCH_COMPILE = 0
         model_cfg.freeze()
 
-    model = HAWOR.load_from_checkpoint(checkpoint_path, strict=False, cfg=model_cfg)
+    # torch >= 2.6 defaults torch.load to weights_only=True, which rejects the Lightning checkpoint
+    # (same trusted-checkpoint load as lib.pipeline.stages.hawor_runtime.load_hawor; not imported
+    # from there because lib.pipeline.stages pulls in every pipeline stage)
+    original_load = torch.load
+    torch.load = lambda *a, **k: original_load(*a, **{"weights_only": False, **k})
+    try:
+        model = HAWOR.load_from_checkpoint(checkpoint_path, strict=False, cfg=model_cfg)
+    finally:
+        torch.load = original_load
     return model, model_cfg
 
 def build_motion_runner(checkpoint_path, device=None):
@@ -146,7 +154,7 @@ def build_motion_runner(checkpoint_path, device=None):
 
 def build_infiller_runner(weight_path, device=None):
     device = device or (torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu'))
-    ckpt = torch.load(weight_path, map_location=device)
+    ckpt = torch.load(weight_path, map_location=device, weights_only=False)
     pos_dim = 3
     shape_dim = 10
     num_joints = 15
@@ -401,10 +409,11 @@ def run_motion_for_video(args, start_idx, end_idx, seq_folder, motion_runner=Non
         last_non_zero = non_zero_indices[-1]
 
         # Interpolate bboxes with size consistency check
-        boxes[first_non_zero:last_non_zero+1] = interpolate_bboxes(boxes[first_non_zero:last_non_zero+1])
+        track_frames = np.array([t['frame'] for t in trk])[first_non_zero:last_non_zero+1]
+        boxes[first_non_zero:last_non_zero+1] = interpolate_bboxes(boxes[first_non_zero:last_non_zero+1], frames=track_frames)
 
         # Apply motion velocity validation to filter implausible movements
-        velocity_valid = validate_motion_velocity(boxes[first_non_zero:last_non_zero+1])
+        velocity_valid = validate_motion_velocity(boxes[first_non_zero:last_non_zero+1], frames=track_frames)
 
         # Update valid mask: only frames that pass both interpolation and velocity check
         valid[first_non_zero:last_non_zero+1] = velocity_valid
@@ -476,6 +485,7 @@ def run_motion_for_video(args, start_idx, end_idx, seq_folder, motion_runner=Non
             do_flip=do_flip,
             chunk_batch_size=getattr(args, 'chunk_batch_size', 4),
             num_workers=getattr(args, 'num_workers', 16),
+            chunk_boundaries=chunk_boundaries,
         )
         if profiler:
             print(f"[PROFILER] Step after inference (track {idx})")
@@ -785,6 +795,16 @@ def run_infiller_for_video(args, start_idx, end_idx, frame_chunks_all, infiller_
     # runing fillingnet for this video
     frame_list = torch.tensor(list(range(pred_trans.size(1))))
     pred_valid = (pred_valid > 0).numpy()
+    # Same semantics as the pipeline infiller (and upstream's window order): a never-observed
+    # hand is still filled while the windows run (each window is anchored on a frame where both
+    # hands are valid), then its original values and invalid flag are restored so no
+    # hallucinated hand is exported.
+    ever_observed = pred_valid.any(axis=1).copy()
+    never_observed_snapshot = {
+        hand: tuple(t[hand].clone() for t in (pred_trans, pred_rot, pred_hand_pose, pred_betas))
+        for hand in (0, 1)
+        if not ever_observed[hand]
+    }
     for k, idx in enumerate([1, 0]):
         missing = ~pred_valid[idx]
 
@@ -796,11 +816,12 @@ def run_infiller_for_video(args, start_idx, end_idx, frame_chunks_all, infiller_
             start_shift = -1
             while frame_ck[0] + start_shift >= 0 and pred_valid[:, frame_ck[0] + start_shift].sum() != 2:
                 start_shift -= 1  # Shift to find the previous valid frame as start
-            vprint(f"run infiller on frame {frame_ck[0] + start_shift} to frame {min(num_frames-1, frame_ck[0] + start_shift + filling_length)}")
+            vprint(f"run infiller on frame {frame_ck[0] + start_shift} to frame {min(num_frames, frame_ck[0] + start_shift + filling_length) - 1}")
 
             frame_start = frame_ck[0]
             filling_net_start = max(0, frame_start + start_shift)
-            filling_net_end = min(num_frames-1, filling_net_start + filling_length)
+            # Exclusive slice end: num_frames (not num_frames-1) so the last frame is included.
+            filling_net_end = min(num_frames, filling_net_start + filling_length)
             seq_valid = pred_valid[:, filling_net_start:filling_net_end]
             filling_seq = {}
             filling_seq['trans'] = pred_trans[:, filling_net_start:filling_net_end].numpy()
@@ -856,6 +877,11 @@ def run_infiller_for_video(args, start_idx, end_idx, frame_chunks_all, infiller_
             pred_hand_pose[:, filling_net_start:filling_net_end] = torch.from_numpy(filling_seq['hand_pose'][:])
             pred_betas[:, filling_net_start:filling_net_end] = torch.from_numpy(filling_seq['betas'][:])
             pred_valid[:, filling_net_start:filling_net_end] = 1
+
+    for hand, originals in never_observed_snapshot.items():
+        for tensor, original in zip((pred_trans, pred_rot, pred_hand_pose, pred_betas), originals):
+            tensor[hand] = original
+        pred_valid[hand] = False
 
     # Numeric guardrail: repair NaN/Inf before saving.
     _sanitize_infiller_tensors(pred_trans, pred_rot, pred_hand_pose, pred_betas)

@@ -1,6 +1,8 @@
 """SLAM + depth stage: DPVO camera tracking plus Any4D metric depth, with cross-batch scale alignment."""
 
 import argparse
+import hashlib
+import json
 import math
 import os
 import shutil
@@ -27,14 +29,15 @@ from lib.pipeline.slam.any4d_depth import (
     iter_any4d_depth_sequence_batches,
 )
 from lib.pipeline.proc.errors import CorruptStageDataError
-from lib.pipeline.slam.depth_stitch import assemble_overlapping_chunks, overlap_frames, stitch_dense_depth, stitch_enabled
+from lib.pipeline.slam.depth_stitch import assemble_overlapping_chunks, overlap_frames, stitch_dense_depth, stitch_enabled, stitch_max_mad
 from lib.pipeline.hands.hand_metric_anchor import (
+    _alpha_lambda,
     compute_hand_anchor_alpha,
     compute_hand_anchor_k,
     hand_anchor_alpha_enabled,
     hand_anchor_enabled,
 )
-from lib.pipeline.slam.dpvo_slam import run_dpvo_slam
+from lib.pipeline.slam.dpvo_slam import DPVO_DISP_RASTER_VERSION, dpvo_config_identity, run_dpvo_slam, dpvo_cache_is_stale
 from lib.pipeline.hands.est_scale_batch import est_scale_hybrid_batch, est_scale_hybrid_gpu
 from lib.pipeline.io.frame_source import ImageFolderFrameSource, build_frame_source
 from lib.pipeline.io.intrinsics import resolve_calibration
@@ -80,6 +83,23 @@ def _load_masks(seq_folder: str, start_idx: int, end_idx: int) -> torch.Tensor:
         return torch.from_numpy(np.load(masks_path, allow_pickle=True))
     except (OSError, ValueError, EOFError, zipfile.BadZipFile, zlib.error) as error:
         raise CorruptStageDataError(f"Corrupt masks file: {masks_path} ({error})") from error
+
+
+def _load_frame_chunks_all(seq_folder: str, start_idx: int, end_idx: int):
+    """Current motion run's per-hand chunk list (tracks_<s>_<e>/frame_chunks_all.npy), or None.
+
+    The hand anchor reads only these cam_space chunks, so stale chunk JSONs from an earlier
+    motion run are ignored (same chunk set as the infiller / hand_shape_stabilize)."""
+    path = os.path.join(seq_folder, f"tracks_{start_idx}_{end_idx}", "frame_chunks_all.npy")
+    if not os.path.exists(path):
+        return None
+    try:
+        import joblib
+
+        return joblib.load(path)
+    except Exception as error:
+        _logger.warning("hand anchor: cannot read %s (%s); falling back to all cam_space chunks", path, error)
+        return None
 
 
 def _depth_predict_all_frames_enabled(explicit: Optional[bool]) -> bool:
@@ -238,13 +258,106 @@ def _dpvo_cache_path(seq_folder: str, start_idx: int, end_idx: int) -> str:
     return os.path.join(seq_folder, "SLAM", f"dpvo_raw_{start_idx}_{end_idx}.npz")
 
 
-def _run_dpvo_with_cache(frame_source, masks, calib, seq_folder: str, start_idx: int, end_idx: int, frame_indices: Optional[np.ndarray] = None):
+# Each SLAM cache (dpvo_raw_*, any4d_depth_dpvo_*, dense_depth_any4d_*) stores, under this key, a
+# digest of everything that produced it (checkpoint, calibration, inference settings, masks / hand
+# inputs where they are used). On lookup a missing (written before digests existed) or different
+# digest is a miss: the old file is renamed to *.stale (never deleted) and recomputed. A forced run
+# (stage force / --no-resume) treats every cache as a miss the same way.
+CACHE_DIGEST_KEY = "cache_config_digest"
+
+
+def _config_digest(payload: dict) -> str:
+    return hashlib.sha1(json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+
+
+def _array_digest(array) -> Optional[str]:
+    """Content digest of an array or tensor (dtype, shape and bytes); None for None."""
+    if array is None:
+        return None
+    if hasattr(array, "detach"):
+        array = array.detach()
+    if hasattr(array, "cpu"):
+        array = array.cpu()
+    if hasattr(array, "numpy"):
+        array = array.numpy()
+    arr = np.ascontiguousarray(np.asarray(array))
+    digest = hashlib.blake2b(digest_size=20)
+    digest.update(f"{arr.dtype.str}{tuple(arr.shape)}".encode("utf-8"))
+    try:
+        digest.update(memoryview(arr.reshape(-1).view(np.uint8)))
+    except (TypeError, ValueError):
+        digest.update(arr.tobytes())
+    return digest.hexdigest()
+
+
+def _file_digest(path: str) -> Optional[str]:
+    try:
+        with open(path, "rb") as handle:
+            return hashlib.sha1(handle.read()).hexdigest()
+    except OSError:
+        return None
+
+
+def _read_cache_digest(cache_path: str) -> Optional[str]:
+    try:
+        with np.load(cache_path, allow_pickle=False) as cached:
+            if CACHE_DIGEST_KEY not in cached.files:
+                return None
+            return str(np.asarray(cached[CACHE_DIGEST_KEY]).reshape(-1)[0])
+    except Exception:
+        return None
+
+
+def _retire_stale_cache(cache_path: str, reason: str) -> Optional[str]:
+    """Rename (never delete) a cache that must not be reused to ``<name>.stale`` (``<name>.<k>.stale``
+    if that exists), so the recomputation does not overwrite it."""
+    if not os.path.exists(cache_path):
+        return None
+    target = f"{cache_path}.stale"
+    k = 1
+    while os.path.exists(target):
+        target = f"{cache_path}.{k}.stale"
+        k += 1
+    os.replace(cache_path, target)
+    vprint(f"SLAM cache {os.path.basename(cache_path)} {reason}: renamed to {os.path.basename(target)}, recomputing.")
+    return target
+
+
+def _retire_unless_current(cache_path: str, digest: str, force: bool) -> None:
+    if not os.path.exists(cache_path):
+        return
+    if force:
+        _retire_stale_cache(cache_path, "not reused (forced rerun)")
+    elif _read_cache_digest(cache_path) != digest:
+        _retire_stale_cache(cache_path, "was written with other inputs/settings (or before cache digests)")
+
+
+def _dpvo_cache_digest(masks_digest: Optional[str], calib, frame_indices) -> str:
+    return _config_digest({
+        "kind": "dpvo_raw",
+        "dpvo": dpvo_config_identity(),
+        "calib": [float(v) for v in np.asarray(calib, dtype=np.float64).reshape(-1)],
+        "frames": None if frame_indices is None else _array_digest(np.asarray(frame_indices, dtype=np.int64)),
+        "masks": masks_digest,
+    })
+
+
+def _run_dpvo_with_cache(frame_source, masks, calib, seq_folder: str, start_idx: int, end_idx: int, frame_indices: Optional[np.ndarray] = None, *, force: bool = False, masks_digest: Optional[str] = None):
     cache_path = _dpvo_cache_path(seq_folder, start_idx, end_idx)
     os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+    if masks_digest is None:
+        masks_digest = _array_digest(masks)
+    digest = _dpvo_cache_digest(masks_digest, calib, frame_indices)
 
     if os.environ.get("HAWOR_DPVO_FORCE_RERUN", "0") == "1" and os.path.exists(cache_path):
         os.remove(cache_path)
         vprint("HAWOR_DPVO_FORCE_RERUN=1: removed cached dpvo_raw, will rerun DPVO.")
+
+    if os.path.exists(cache_path) and dpvo_cache_is_stale(cache_path):
+        os.remove(cache_path)
+        vprint(f"DPVO cache predates disparity raster v{DPVO_DISP_RASTER_VERSION}: removed dpvo_raw, will rerun DPVO.")
+
+    _retire_unless_current(cache_path, digest, force)
 
     ran_fresh = not os.path.exists(cache_path)
     if ran_fresh:
@@ -260,6 +373,8 @@ def _run_dpvo_with_cache(frame_source, masks, calib, seq_folder: str, start_idx:
             tstamp_disps=np.asarray(disp_tstamp, dtype=np.int32),
             dpvo_vo_wall_sec=wall_sec,
             dpvo_subprocess_sec=wall_sec,
+            disp_raster_version=np.array([DPVO_DISP_RASTER_VERSION], dtype=np.int32),
+            **{CACHE_DIGEST_KEY: np.array(digest)},
         )
         torch.cuda.empty_cache()
 
@@ -276,7 +391,12 @@ def _run_dpvo_with_cache(frame_source, masks, calib, seq_folder: str, start_idx:
                 cached_vo_sec = float(np.asarray(cached["dpvo_subprocess_sec"]).reshape(-1)[0])
     except (OSError, ValueError, EOFError, zipfile.BadZipFile, zlib.error) as error:
         _drop_corrupt_cache(cache_path, error)
-        return _run_dpvo_with_cache(frame_source, masks, calib, seq_folder, start_idx, end_idx, frame_indices=frame_indices)
+        return _run_dpvo_with_cache(frame_source, masks, calib, seq_folder, start_idx, end_idx, frame_indices=frame_indices, masks_digest=masks_digest)
+
+    if not ran_fresh and not np.isfinite(traj_full).all():
+        # a diverged run cached by an older version: set it aside and rerun (with the seeded retries)
+        _retire_stale_cache(cache_path, "holds non-finite DPVO poses")
+        return _run_dpvo_with_cache(frame_source, masks, calib, seq_folder, start_idx, end_idx, frame_indices=frame_indices, masks_digest=masks_digest)
 
     traj_dense = traj_full.astype(np.float32)
     tstamp_dense = tstamp_full.astype(np.int32)
@@ -332,15 +452,21 @@ def _any4d_cache_path(seq_folder: str, start_idx: int, end_idx: int, suffix: str
     return os.path.join(seq_folder, "SLAM", f"any4d_depth_dpvo_{start_idx}_{end_idx}{suffix}.npz")
 
 
-def _save_dense_depth_uint16_npz(out_path: str, frame_indices, depths, per_frame_scale=None):
+def _save_dense_depth_uint16_npz(out_path: str, frame_indices, depths, per_frame_scale=None, cache_digest: Optional[str] = None):
     # nan_to_num returns a fresh array, so the optional per-frame scaling below never mutates the
     # caller's depth (which est_scale still reads as views) — the refinement lives on disk only.
+    # The applied per-frame scale is saved with it so a cache hit can undo it (_load_dense_depth_cache)
+    # and give est_scale the same depth as the run that wrote the cache.
     depth_stack = np.asarray(depths, dtype=np.float32)
     depth_stack = np.nan_to_num(depth_stack, nan=0.0, posinf=0.0, neginf=0.0)
+    extra = {}
     if per_frame_scale is not None:
         s = np.asarray(per_frame_scale, dtype=np.float32).reshape(-1)
         if s.shape[0] == depth_stack.shape[0]:
             depth_stack *= s[:, None, None]
+            extra["per_frame_scale"] = s
+    if cache_digest is not None:
+        extra[CACHE_DIGEST_KEY] = np.array(cache_digest)
     depth_stack = np.clip(depth_stack, 0.0, None)
     depth_mm = np.clip(np.round(depth_stack * 1000.0), 0.0, 65535.0).astype(np.uint16)
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
@@ -350,6 +476,7 @@ def _save_dense_depth_uint16_npz(out_path: str, frame_indices, depths, per_frame
         depths_uint16=depth_mm,
         height=np.int32(depth_stack.shape[1]),
         width=np.int32(depth_stack.shape[2]),
+        **extra,
     )
 
 
@@ -384,6 +511,8 @@ def _is_corrupt_stage_data_error(error: Exception) -> bool:
 
 
 def _load_dense_depth_cache(cache_path: str):
+    """(frame_indices, depths) of a dense-depth cache, as the scale estimation saw them: a per-frame
+    depth-map refinement stored with the cache (per_frame_scale) is divided back out."""
     if not os.path.exists(cache_path):
         return None
 
@@ -396,15 +525,23 @@ def _load_dense_depth_cache(cache_path: str):
                 depths = cached["pred_depths"].astype(np.float32)
             else:
                 return None
+            per_frame_scale = cached["per_frame_scale"].astype(np.float32).reshape(-1) if "per_frame_scale" in cached.files else None
     except (OSError, ValueError, EOFError, zipfile.BadZipFile, zlib.error) as error:
         _drop_corrupt_cache(cache_path, error)
         return None
+    if per_frame_scale is not None and per_frame_scale.shape[0] == depths.shape[0]:
+        safe = np.where(per_frame_scale > 0, per_frame_scale, np.float32(1.0)).astype(np.float32)
+        depths /= safe[:, None, None]
     return frame_indices, depths
 
 
-def _load_matching_dense_depth_cache(seq_folder: str, start_idx: int, end_idx: int, frame_ids: np.ndarray):
+def _load_matching_dense_depth_cache(seq_folder: str, start_idx: int, end_idx: int, frame_ids: np.ndarray, digest: Optional[str] = None):
+    """A dense-depth cache for exactly these frames whose stored digest equals ``digest`` (caches
+    without a digest never match)."""
     candidate_paths = [_dense_depth_cache_path(seq_folder, start_idx, end_idx), *_legacy_dense_depth_cache_paths(seq_folder, start_idx, end_idx)]
     for cache_path in candidate_paths:
+        if not os.path.exists(cache_path) or _read_cache_digest(cache_path) != digest:
+            continue
         cached = _load_dense_depth_cache(cache_path)
         if cached is None:
             continue
@@ -412,6 +549,85 @@ def _load_matching_dense_depth_cache(seq_folder: str, start_idx: int, end_idx: i
         if np.array_equal(cached_ids, frame_ids):
             return cached_ids, cached_depths, cache_path
     return None
+
+
+def _checkout_relative(path) -> str:
+    """``path`` relative to the code checkout when it lies inside it (absolute otherwise), so a cache
+    digest does not change when the same checkout is cloned or moved to another directory."""
+    absolute = os.path.abspath(str(path))
+    root = str(PROJECT_ROOT)
+    if absolute == root or absolute.startswith(root + os.sep):
+        return os.path.relpath(absolute, root)
+    return absolute
+
+
+def _any4d_cache_digest(any4d_runner, args, any4d_batch_size: int, output_hw, frame_ids, *, traj_dense=None, focal=None, calib=None) -> str:
+    """Everything that changes the Any4D depth for these frames (see _predict_any4d_depths_for_frames)."""
+    runner = any4d_runner if isinstance(any4d_runner, dict) else {}
+
+    def _setting(name):
+        value = runner.get(name)
+        return value if value is not None else getattr(args, f"any4d_{name}", None)
+
+    checkpoint = _setting("checkpoint_path")
+    try:
+        checkpoint_size = int(os.path.getsize(checkpoint)) if checkpoint else None
+    except OSError:
+        checkpoint_size = None
+    overlap = overlap_frames()
+    task = str(runner.get("task", "images_only"))
+    payload = {
+        "kind": "any4d_depth",
+        "checkpoint": [None if checkpoint is None else _checkout_relative(checkpoint), checkpoint_size],
+        "resolution_set": _setting("resolution_set"),
+        "use_amp": _setting("use_amp"),
+        "task": task,
+        "batch_size": int(any4d_batch_size),
+        "overlap": int(overlap),
+        "stitch_max_mad": stitch_max_mad() if overlap > 0 else None,
+        "output_hw": [int(v) for v in output_hw],
+        "frames": _array_digest(np.asarray(frame_ids, dtype=np.int64)),
+    }
+    if task != "images_only":
+        payload["poses"] = {
+            "traj": None if traj_dense is None else _array_digest(np.asarray(traj_dense, dtype=np.float32)),
+            "focal": None if focal is None else float(focal),
+            "calib": None if calib is None else [float(v) for v in np.asarray(calib, dtype=np.float64).reshape(-1)],
+        }
+    return _config_digest(payload)
+
+
+def _hand_anchor_identity(seq_folder: str, start_idx: int, end_idx: int, masks_digest: Optional[str]):
+    """Switches and inputs of the hand-metric anchor (None when it is off): masks, the motion run's
+    chunk list and the cam_space hand JSONs it reads."""
+    if not (hand_anchor_enabled() or hand_anchor_alpha_enabled()):
+        return None
+    cam_space = os.path.join(seq_folder, "cam_space")
+    hand_files = []
+    if os.path.isdir(cam_space):
+        for root, _dirs, files in os.walk(cam_space):
+            for name in files:
+                if name.endswith(".json"):
+                    path = os.path.join(root, name)
+                    hand_files.append([os.path.relpath(path, seq_folder), _file_digest(path)])
+    return {
+        "k": hand_anchor_enabled(),
+        "alpha": hand_anchor_alpha_enabled(),
+        "alpha_lambda": _alpha_lambda() if hand_anchor_alpha_enabled() else None,
+        "masks": masks_digest,
+        "frame_chunks_all": _file_digest(os.path.join(seq_folder, f"tracks_{start_idx}_{end_idx}", "frame_chunks_all.npy")),
+        "cam_space": sorted(hand_files),
+    }
+
+
+def _dense_depth_cache_digest(any4d_digest: str, masks_digest: Optional[str], seq_folder: str, start_idx: int, end_idx: int, any4d_batch_size: int) -> str:
+    """The Any4D depth it starts from plus every post-process applied before it is saved."""
+    return _config_digest({
+        "kind": "dense_depth",
+        "any4d": any4d_digest,
+        "stitch": {"batch_size": int(any4d_batch_size), "masks": masks_digest} if (stitch_enabled() and overlap_frames() == 0) else None,
+        "hand_anchor": _hand_anchor_identity(seq_folder, start_idx, end_idx, masks_digest),
+    })
 
 
 def _load_matching_any4d_cache(cache_path: str, frame_ids: np.ndarray, output_hw):
@@ -487,6 +703,8 @@ def _predict_any4d_depths_for_frames(
     traj_dense=None,     # (N,7) c2w from DPVO; required when task is pose-conditioned (Goal A.1)
     focal=None,          # scalar; required with traj_dense
     calib=None,          # [fx, fy, cx, cy]; required with traj_dense (for principal point)
+    force: bool = False,  # stage force / --no-resume: do not reuse the cache
+    config_digest: Optional[str] = None,  # _any4d_cache_digest of these inputs, if already computed
 ):
     # The all-frames depth is cached, so the cache key MUST encode everything that changes the
     # depth — otherwise a different setting silently reuses a stale cache. Two contributors:
@@ -502,14 +720,21 @@ def _predict_any4d_depths_for_frames(
     if task != "images_only":
         cache_suffix += f"_{task}"
     cache_path = _any4d_cache_path(seq_folder, start_idx, end_idx, suffix=cache_suffix)
-    force = os.environ.get("HAWOR_ANY4D_FORCE_RERUN", "0") == "1"
-    if force and os.path.isfile(cache_path):
+    # The suffix only names the file; the stored digest carries the full identity (checkpoint,
+    # resolution, AMP, batch size, frames, poses for a pose-conditioned task, ...).
+    if config_digest is None:
+        config_digest = _any4d_cache_digest(
+            any4d_runner, args, any4d_batch_size, output_hw, frame_ids, traj_dense=traj_dense, focal=focal, calib=calib,
+        )
+    env_force = os.environ.get("HAWOR_ANY4D_FORCE_RERUN", "0") == "1"
+    if env_force and os.path.isfile(cache_path):
         try:
             os.remove(cache_path)
         except OSError:
             pass
+    _retire_unless_current(cache_path, config_digest, force)
 
-    if not force:
+    if not env_force:
         t_cache_lookup = time.time()
         cached_depths = _load_matching_any4d_cache(cache_path, frame_ids, output_hw)
         if timing is not None:
@@ -633,6 +858,7 @@ def _predict_any4d_depths_for_frames(
         cache_path,
         depths=np.asarray(pred_depths, dtype=np.float32),
         frame_indices=np.asarray(frame_ids, dtype=np.int64),
+        **{CACHE_DIGEST_KEY: np.array(config_digest)},
     )
     if timing is not None:
         timing["3f_any4d_cache_save"] = timing.get("3f_any4d_cache_save", 0.0) + (time.time() - t_cache_save)
@@ -656,7 +882,10 @@ def _estimate_scale(disps, pred_depths, masks, tstamp):
     min_threshold = 0.4
     max_threshold = 0.7
 
-    slam_depth_list = [1.0 / disps[i] for i in range(len(tstamp))]
+    # DPVO disparity maps are sparse (disp=0 where no patch landed); 1/0 -> inf is
+    # intentional and est_scale_* drops those pixels via _valid_slam_depth.
+    with np.errstate(divide="ignore"):
+        slam_depth_list = [1.0 / disps[i] for i in range(len(tstamp))]
     mask_list = [masks[int(frame_idx)].cpu().numpy().astype(np.uint8) for frame_idx in tstamp]
     scales_ = est_scale_hybrid_batch(
         slam_depth_list,
@@ -789,7 +1018,9 @@ def hawor_slam(
     frame_source=None,
     seq_folder=None,
     return_timing=False,
+    force=False,
 ):
+    """``force`` (stage force / --no-resume) recomputes DPVO and depth instead of reusing any cache."""
     timing = {}
     stats = {}
     start_time = time.time()
@@ -822,6 +1053,7 @@ def hawor_slam(
     try:
         t0 = time.time()
         masks = _load_masks(seq_folder, start_idx, end_idx)
+        masks_digest = _array_digest(masks)
         calib = resolve_calibration(
             stage3_frame_source, seq_folder, requested_focal=getattr(args, "img_focal", None)
         )
@@ -837,6 +1069,8 @@ def hawor_slam(
             start_idx,
             end_idx,
             frame_indices=segment_frame_ids,
+            force=force,
+            masks_digest=masks_digest,
         )
         traj_dense = slam_outputs.get("traj_dense", slam_outputs["traj"])
         tstamp = slam_outputs.get("tstamp_metric", slam_outputs["tstamp"])
@@ -864,6 +1098,10 @@ def hawor_slam(
         t0 = time.time()
         if predict_all_frames:
             frame_ids = segment_frame_ids
+            any4d_digest = _any4d_cache_digest(
+                any4d_runner, args, any4d_batch_size, output_hw, frame_ids, traj_dense=traj_dense, focal=focal, calib=calib,
+            )
+            dense_digest = _dense_depth_cache_digest(any4d_digest, masks_digest, seq_folder, start_idx, end_idx, any4d_batch_size)
 
             force_any4d_rerun = os.environ.get("HAWOR_ANY4D_FORCE_RERUN", "0") == "1"
             if force_any4d_rerun:
@@ -873,7 +1111,9 @@ def hawor_slam(
                         os.remove(dense_cache_path)
                     except OSError:
                         pass
-            cached_dense = None if force_any4d_rerun else _load_matching_dense_depth_cache(seq_folder, start_idx, end_idx, frame_ids)
+            # Checked before the Any4D cache, so it must carry the Any4D identity too (dense_digest does).
+            _retire_unless_current(_dense_depth_cache_path(seq_folder, start_idx, end_idx), dense_digest, force)
+            cached_dense = None if (force_any4d_rerun or force) else _load_matching_dense_depth_cache(seq_folder, start_idx, end_idx, frame_ids, digest=dense_digest)
             timing["3b_dense_depth_cache_lookup"] = time.time() - t0
             if cached_dense is not None:
                 depth_frame_indices, depth_predictions, depth_cache_path = cached_dense
@@ -896,6 +1136,8 @@ def hawor_slam(
                     traj_dense=traj_dense,
                     focal=focal,
                     calib=calib,
+                    force=force,
+                    config_digest=any4d_digest,
                 )
                 depth_frame_indices = frame_ids.astype(np.int64)
                 # Phase 1: remove Any4D per-batch metric-scale steps before saving / scale-est
@@ -948,13 +1190,16 @@ def hawor_slam(
                             return None
 
                     t_ha = time.time()
+                    ha_chunks = _load_frame_chunks_all(seq_folder, start_idx, end_idx)
                     if hand_anchor_alpha_enabled():
                         alpha_arr, k_anchor, ha_info = compute_hand_anchor_alpha(
                             depth_predictions, depth_frame_indices, seq_folder, _mask_ha,
+                            frame_chunks_all=ha_chunks,
                         )
                     else:
                         k_anchor, ha_info = compute_hand_anchor_k(
                             depth_predictions, depth_frame_indices, seq_folder, _mask_ha,
+                            frame_chunks_all=ha_chunks,
                         )
                         alpha_arr = None
                     anchored = bool(ha_info.get("applied")) and k_anchor > 0 and abs(k_anchor - 1.0) > 1e-6
@@ -984,6 +1229,7 @@ def hawor_slam(
                 _save_dense_depth_uint16_npz(
                     dense_cache_path, depth_frame_indices, depth_predictions,
                     per_frame_scale=dense_per_frame_scale,
+                    cache_digest=dense_digest,
                 )
                 timing["3g_dense_depth_cache_save"] = time.time() - t_dense_save
                 depth_cache_path = any4d_cache_path if used_any4d_cache else dense_cache_path
@@ -1010,6 +1256,7 @@ def hawor_slam(
                 traj_dense=traj_dense,
                 focal=focal,
                 calib=calib,
+                force=force,
             )
             keyframe_depths = [depth_predictions[i] for i in range(len(depth_predictions))]
             stats["any4d_batch_cache_hit"] = int(bool(depth_cache_used))

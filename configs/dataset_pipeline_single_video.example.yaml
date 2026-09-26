@@ -24,6 +24,14 @@ video: /path/to/input.mp4
 #   annotation_suffix: _qwen-annotation.json
 #   workers: 4
 
+# Optional LeRobot v3.0 export. Only runs when `lerobot` is in --stages
+# (e.g. --stages prepare,infer,filter,build,validate,lerobot). Keys are forwarded to
+# scripts/build/wds_to_lerobot.py; output goes to <output_root>/lerobot by default.
+# lerobot:
+#   hand_frame: world
+#   state_layout: egosteer74
+#   validate: true
+
 # Optional annotation stage. If this block has no command, the default run skips
 # annotate and exports empty instruction/language fields.
 # annotation:

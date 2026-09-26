@@ -57,7 +57,12 @@ def get_parser():
     parser.add_argument(
         "--resume",
         action="store_true",
-        help="Skip non-empty shard tar files that already exist in output_dir",
+        help=(
+            "Reuse an existing non-empty shard only when output_dir/_shard_plan.json records the same build digest "
+            "for it (manifest slice, upstream artifacts, options); every other shard is rebuilt, and without a "
+            "usable _shard_plan.json all shards are rebuilt. With or without --resume, shard-*.tar files outside the "
+            "current plan (or left empty by it) are renamed to *.stale, never deleted"
+        ),
     )
     parser.add_argument(
         "--export_depth",

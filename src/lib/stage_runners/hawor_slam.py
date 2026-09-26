@@ -69,9 +69,12 @@ def _resolve_any4d_paths(
 
     _ckpt = any4d_checkpoint_path
     if _ckpt is None or str(_ckpt).strip() == "":
+        # Default mirrors lib.pipeline.slam.any4d_depth.resolve_any4d_paths:
+        # <any4d_repo_root>/checkpoints/any4d_4v_combined.pth (where
+        # scripts/setup/download_weights.sh installs it).
         _ckpt = os.environ.get(
             "HAWOR_ANY4D_CHECKPOINT_PATH",
-            os.path.join(project_root, "checkpoints", "any4d_4v_combined.pth"),
+            os.path.join(any4d_repo_root_resolved, "checkpoints", "any4d_4v_combined.pth"),
         ).strip()
     else:
         _ckpt = str(_ckpt).strip()
@@ -355,6 +358,38 @@ def _effective_depth_backend(depth_backend: Optional[str]) -> str:
     return s
 
 
+def _fill_nan_scales(scales_, slam_depth_list, pred_depths, mask_list, min_threshold, max_threshold):
+    """Replace NaN per-keyframe scales in place (same policy as pipeline/stages/slam.py).
+
+    Each NaN keyframe retries with the depth band widened by 0.1 at most 10 times;
+    still-NaN ones fall back to the median of the valid keyframe scales. Raises if
+    no keyframe yields a valid scale.
+    """
+    for i in range(len(scales_)):
+        if not math.isnan(scales_[i]):
+            continue
+        nt, ft = min_threshold, max_threshold
+        for _ in range(10):
+            nt -= 0.1
+            ft += 0.1
+            scales_[i] = est_scale_hybrid_gpu(
+                slam_depth_list[i], pred_depths[i], sigma=0.5,
+                msk=mask_list[i], near_thresh=nt, far_thresh=ft)
+            if not math.isnan(scales_[i]):
+                break
+
+    valid_scales = [scale for scale in scales_ if not math.isnan(scale)]
+    if not valid_scales:
+        raise RuntimeError(
+            f"hawor_slam: metric scale estimation failed for all {len(scales_)} keyframes "
+            "(NaN even after widening the depth band); no valid SLAM/depth overlap to anchor the scale."
+        )
+    fallback = np.median(valid_scales)
+    for i in range(len(scales_)):
+        if math.isnan(scales_[i]):
+            scales_[i] = fallback
+
+
 def hawor_slam(
     args,
     start_idx,
@@ -446,6 +481,11 @@ def hawor_slam(
         os.remove(dpvo_npz_path)
         vprint("HAWOR_DPVO_FORCE_RERUN=1: removed cached dpvo_raw, will rerun DPVO.")
 
+    from lib.pipeline.slam.dpvo_slam import DPVO_DISP_RASTER_VERSION, dpvo_cache_is_stale
+    if os.path.exists(dpvo_npz_path) and dpvo_cache_is_stale(dpvo_npz_path):
+        os.remove(dpvo_npz_path)
+        vprint(f"DPVO cache predates disparity raster v{DPVO_DISP_RASTER_VERSION}: removed dpvo_raw, will rerun DPVO.")
+
     # Run DPVO VO in the current process (lazy import to avoid loading DPVO unless this path runs).
     dpvo_ran_fresh = not os.path.exists(dpvo_npz_path)
     if dpvo_ran_fresh:
@@ -465,6 +505,7 @@ def hawor_slam(
             tstamp_disps=tstamp_disps,
             dpvo_vo_wall_sec=_dpvo_sec,
             dpvo_subprocess_sec=_dpvo_sec,
+            disp_raster_version=np.array([DPVO_DISP_RASTER_VERSION], dtype=np.int32),
         )
         try:
             torch.cuda.empty_cache()
@@ -610,22 +651,16 @@ def hawor_slam(
     disps = disps_metric
     traj = traj_full.astype(np.float32)
 
-    slam_depth_list = [1.0 / disps[int(i)] for i in kf_idx]
+    # Sparse DPVO disparity: disp=0 -> inf depth, excluded inside est_scale_*.
+    with np.errstate(divide="ignore"):
+        slam_depth_list = [1.0 / disps[int(i)] for i in kf_idx]
     mask_list = [masks[int(tstamp_metric[i])].numpy().astype(np.uint8) for i in kf_idx]
 
     scales_ = est_scale_hybrid_batch(
         slam_depth_list, pred_depths, sigma=0.5,
         masks=mask_list, near_thresh=min_threshold, far_thresh=max_threshold)
 
-    for i in range(len(scales_)):
-        if math.isnan(scales_[i]):
-            nt, ft = min_threshold, max_threshold
-            while math.isnan(scales_[i]):
-                nt -= 0.1
-                ft += 0.1
-                scales_[i] = est_scale_hybrid_gpu(
-                    slam_depth_list[i], pred_depths[i], sigma=0.5,
-                    msk=mask_list[i], near_thresh=nt, far_thresh=ft)
+    _fill_nan_scales(scales_, slam_depth_list, pred_depths, mask_list, min_threshold, max_threshold)
 
     median_s = np.median(scales_)
     vprint(f"estimated scale: {median_s}")

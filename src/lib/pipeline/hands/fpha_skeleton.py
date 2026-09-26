@@ -387,6 +387,7 @@ def fit_right_hand_mano_sequence(
                     + global_orient[1:].sub(global_orient[:-1]).square().mean()
                     + transl[1:].sub(transl[:-1]).square().mean()
                 )
+            loss.backward()
             optimizer.step()
 
         with torch.no_grad():

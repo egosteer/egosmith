@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import os
@@ -13,6 +14,7 @@ from multiprocessing import current_process
 import torch
 
 from lib.pipeline.slam.depth_artifacts import DEPTH_EXPORT_ENCODING, DEPTH_EXPORT_SCHEMA, encode_depth_npy
+from lib.pipeline.slam.native_depth import get_native_depth_output_path
 from lib.pipeline.exporters.mano_codec import mano_meta_fields
 from lib.pipeline.exporters.shard_io import encode_array_npy, encode_lowdim_npy
 from lib.pipeline.exporters.webdataset_workers import normalize_mano_devices
@@ -23,7 +25,8 @@ from lib.pipeline.io.frame_sources import (
 )
 from lib.pipeline.exporters.webdataset_features import build_mano_models
 
-from .episodes import load_descriptor_episode_features
+from .cache import feature_cache_dependencies
+from .episodes import descriptor_uses_native_features, load_descriptor_episode_features
 
 WRITE_PREFETCH_THREADS = 4
 WRITE_PREFETCH_DEPTH = 16
@@ -84,6 +87,7 @@ def plan_manifest_shards(episodes: list[dict], frames_per_shard: int, output_dir
                 "target_fps": float(ep.get("target_fps", 30.0)),
                 "interpolate_labels": bool(ep.get("interpolate_labels", False)),
                 "export_depth": bool(ep.get("export_depth", False)),
+                "repeat_index": int(ep.get("repeat_index", 0)),
             }
         )
         shard_frame_count += num_frames
@@ -92,6 +96,33 @@ def plan_manifest_shards(episodes: list[dict], frames_per_shard: int, output_dir
 
     flush_current()
     return tasks
+
+
+def _slice_upstream_dependencies(episode_slice: dict) -> dict:
+    """Identity of the upstream artifacts one slice's samples are read from (same set the feature
+    cache keys on), plus the native depth artifact when depth is exported."""
+    descriptor = episode_slice.get("descriptor")
+    native = descriptor is not None and hasattr(descriptor, "extra") and descriptor_uses_native_features(descriptor)
+    extra_files = [getattr(descriptor, "shard_path", None)] if native else []
+    if episode_slice.get("export_depth", False):
+        # result.npz and SLAM/dense_depth_*.npz are already covered; the native depth npz is not
+        extra_files.append(str(get_native_depth_output_path(episode_slice["seq_folder"])))
+    return feature_cache_dependencies(episode_slice["seq_folder"], extra_files=tuple(extra_files))
+
+
+def shard_task_digest(task: dict, options_digest: str) -> str:
+    """Identity of one planned shard: its episode/frame slices, the upstream artifacts they are read
+    from, plus the content-affecting build options.
+    ``--resume`` reuses an existing shard only when the digest recorded for it matches."""
+    slices = []
+    for episode_slice in task["episode_slices"]:
+        entry = dict(episode_slice)
+        descriptor = entry.get("descriptor")
+        entry["descriptor"] = descriptor.to_dict() if hasattr(descriptor, "to_dict") else descriptor
+        entry["upstream"] = _slice_upstream_dependencies(episode_slice)
+        slices.append(entry)
+    payload = {"options": options_digest, "frame_count": task["frame_count"], "episode_slices": slices}
+    return hashlib.sha1(json.dumps(payload, sort_keys=True, default=str, ensure_ascii=False).encode("utf-8")).hexdigest()
 
 
 def repeat_manifest_episodes(episodes: list[dict], repeat_count: int) -> list[dict]:
@@ -105,6 +136,16 @@ def repeat_manifest_episodes(episodes: list[dict], repeat_count: int) -> list[di
             ep_copy["episode_index"] = len(repeated)
             repeated.append(ep_copy)
     return repeated
+
+
+def manifest_sample_key(clip_id: str, frame_idx: int, repeat_index: int = 0) -> str:
+    """WDS sample key; repeats after the first get a unique ``__rep<k>`` episode suffix.
+
+    The suffix sits before ``_f<frame>`` so the key still parses as ``<episode>_f<frame>``;
+    the original clip id stays in the sample meta for provenance.
+    """
+    episode = str(clip_id) if int(repeat_index) <= 0 else f"{clip_id}__rep{int(repeat_index)}"
+    return f"{episode}_f{int(frame_idx):06d}"
 
 
 def prepare_sample_payload_from_bytes(key: str, image_bytes: bytes, lowdim, mano, meta_bytes: bytes, depth=None):
@@ -259,7 +300,7 @@ def worker_process_shard(task):
                     for frame_idx in range(int(episode_slice["frame_start"]), frame_end):
                         image_bytes = read_frame_bytes(frame_idx)
                         presence = int(episode_data["presence_per_frame"][frame_idx])
-                        key = f"{episode_slice['clip_id']}_f{frame_idx:06d}"
+                        key = manifest_sample_key(episode_slice["clip_id"], frame_idx, episode_slice.get("repeat_index", 0))
                         meta_bytes = meta_prefix + str(presence).encode("ascii") + b"}"
                         pending.append(
                             prefetch_pool.submit(
@@ -341,6 +382,7 @@ __all__ = [
     "normalize_mano_devices",
     "plan_manifest_shards",
     "repeat_manifest_episodes",
+    "shard_task_digest",
     "worker_init",
     "worker_process_shard",
 ]

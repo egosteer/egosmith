@@ -57,16 +57,46 @@ def _alpha_lambda() -> float:
         return 50.0
 
 
-def _load_hand_cam_z(seq_folder: str, n_frames: int) -> np.ndarray:
-    """Per-frame camera-frame wrist z (meters) from cam_space chunk JSONs (init_trans[...,2]),
-    combined over hands. NaN where no hand. Indexed by absolute frame id."""
-    z = np.full((n_frames,), np.nan, np.float32)
-    per_hand = []
+def _current_chunk_files(seq_folder: str, frame_chunks_all):
+    """Yield (hand_dir, [(json_path, frame_ids or None), ...]) for the cam_space chunks to read.
+
+    With ``frame_chunks_all`` (the current motion run's chunk list, as saved in
+    tracks_<s>_<e>/frame_chunks_all.npy) only those chunks are read — the same set the infiller
+    and hand_shape_stabilize use — so stale chunk JSONs left by an earlier motion run cannot
+    overwrite current wrist depth. Without it, every *.json under cam_space/<hand>/ is globbed
+    (legacy behaviour)."""
+    if frame_chunks_all is not None:
+        for hand_idx in (0, 1):
+            files = []
+            for frame_ck in frame_chunks_all.get(hand_idx, []):
+                ck = np.asarray(frame_ck).reshape(-1)
+                if ck.size == 0:
+                    continue
+                key = f"{int(ck[0])}_{int(ck[-1])}"
+                files.append((os.path.join(seq_folder, "cam_space", str(hand_idx), f"{key}.json"), ck))
+            yield os.path.join(seq_folder, "cam_space", str(hand_idx)), files
+        return
     for hand_dir in sorted(glob.glob(os.path.join(seq_folder, "cam_space", "*"))):
         if not os.path.isdir(hand_dir):
             continue
+        yield hand_dir, [(jf, None) for jf in sorted(glob.glob(os.path.join(hand_dir, "*.json")))]
+
+
+def _load_hand_cam_z(seq_folder: str, n_frames: int, frame_chunks_all=None) -> np.ndarray:
+    """Per-frame camera-frame wrist z (meters) from cam_space chunk JSONs (init_trans[...,2]),
+    combined over hands. NaN where no hand. Indexed by absolute frame id.
+
+    ``frame_chunks_all`` restricts the read to the current motion run's chunks (see
+    ``_current_chunk_files``)."""
+    z = np.full((n_frames,), np.nan, np.float32)
+    per_hand = []
+    for _hand_dir, files in _current_chunk_files(seq_folder, frame_chunks_all):
+        if not files:
+            continue
         zi = np.full((n_frames,), np.nan, np.float32)
-        for jf in sorted(glob.glob(os.path.join(hand_dir, "*.json"))):
+        for jf, ck in files:
+            if not os.path.exists(jf):
+                continue
             base = os.path.splitext(os.path.basename(jf))[0]
             try:
                 s, _e = (int(x) for x in base.split("_"))
@@ -77,7 +107,10 @@ def _load_hand_cam_z(seq_folder: str, n_frames: int) -> np.ndarray:
             except Exception:
                 continue
             tz = trans[0, :, 2]
-            idx = np.arange(s, s + tz.shape[0])
+            if ck is not None and ck.size == tz.shape[0]:
+                idx = ck.astype(np.int64)
+            else:
+                idx = np.arange(s, s + tz.shape[0])
             ok = (idx >= 0) & (idx < n_frames)
             zi[idx[ok]] = tz[ok]
         per_hand.append(zi)
@@ -110,6 +143,7 @@ def _per_frame_hand_vs_depth(
     depth_min: float,
     depth_max: float,
     min_mask_pixels: int,
+    frame_chunks_all=None,
 ):
     """Per-frame (parallel to ``depths``) hand_cam_z and median Any4D depth at the hand mask.
 
@@ -118,7 +152,9 @@ def _per_frame_hand_vs_depth(
     non-empty only on a hard failure (no cam_space / no mask accessor)."""
     n, H, W = depths.shape
     fids = np.asarray(frame_indices).reshape(-1)
-    hand_z_by_fid = _load_hand_cam_z(seq_folder, int(fids.max()) + 1 if fids.size else n)
+    hand_z_by_fid = _load_hand_cam_z(
+        seq_folder, int(fids.max()) + 1 if fids.size else n, frame_chunks_all=frame_chunks_all,
+    )
     hand_z = np.full(n, np.nan, np.float64)
     depth_at_hand = np.full(n, np.nan, np.float64)
     valid = np.zeros(n, bool)
@@ -160,6 +196,7 @@ def compute_hand_anchor_k(
     min_frames: int = 8,
     k_lo: float = 1e-2,
     k_hi: float = 1e2,
+    frame_chunks_all=None,
 ):
     """Global hand-anchor factor k so that depth*k matches the HaWoR hand metric.
 
@@ -170,6 +207,7 @@ def compute_hand_anchor_k(
     hand_z, depth_at_hand, valid, reason = _per_frame_hand_vs_depth(
         depths, frame_indices, seq_folder, get_mask,
         depth_min=depth_min, depth_max=depth_max, min_mask_pixels=min_mask_pixels,
+        frame_chunks_all=frame_chunks_all,
     )
     if reason:
         info["reason"] = reason
@@ -196,6 +234,7 @@ def compute_hand_anchor_alpha(
     min_frames: int = 8,
     lam: Optional[float] = None,
     sigma: float = 0.5,
+    frame_chunks_all=None,
 ):
     """Per-frame smooth depth->hand scale α(t) and the global level k.
 
@@ -211,6 +250,7 @@ def compute_hand_anchor_alpha(
     hand_z, depth_at_hand, valid, reason = _per_frame_hand_vs_depth(
         depths, frame_indices, seq_folder, get_mask,
         depth_min=depth_min, depth_max=depth_max, min_mask_pixels=min_mask_pixels,
+        frame_chunks_all=frame_chunks_all,
     )
     if reason:
         info["reason"] = reason

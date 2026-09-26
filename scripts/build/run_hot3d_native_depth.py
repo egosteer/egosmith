@@ -199,13 +199,26 @@ def _process_record(record, args, runner: dict) -> dict:
     output_path = get_native_depth_output_path(seq_folder)
 
     if args.resume and done_marker.is_file() and output_path.is_file():
-        summary = validate_native_depth_output(seq_folder, expected_frame_count=descriptor.frame_count)
-        return {
-            "clip_id": record.clip_id,
-            "seq_folder": str(seq_folder),
-            "status": "skipped",
-            "summary": summary,
-        }
+        try:
+            summary = validate_native_depth_output(seq_folder, expected_frame_count=descriptor.frame_count)
+        except Exception as exc:
+            # --resume skips only clips whose artifact validates: recompute this one, and drop the
+            # marker first so a failure below cannot be read back as "completed".
+            print(f"[native_depth] {record.clip_id}: existing artifact failed validation ({exc}); recomputing", file=sys.stderr)
+            done_marker.unlink(missing_ok=True)
+        else:
+            return {
+                "clip_id": record.clip_id,
+                "seq_folder": str(seq_folder),
+                "status": "skipped",
+                "summary": summary,
+            }
+
+    if not args.resume:
+        # Forced re-run (no --resume): drop this clip's stale 0-byte .native_depth.done marker first so
+        # a failure in this run cannot be read back as "completed" from the previous run's marker.
+        # It is re-created below once the new depth artifact is saved.
+        done_marker.unlink(missing_ok=True)
 
     if descriptor.storage_kind != "tar_shard" or not descriptor.shard_path:
         raise ValueError(f"HOT3D native depth only supports tar_shard descriptors, got {descriptor.storage_kind}")

@@ -194,11 +194,19 @@ def build_frame_bytes_reader(
                     )
                 offset, size = frame_offsets[frame_idx]
                 fd = None if shard_fd_cache is None else shard_fd_cache.get(shard_path)
+                owned_fd = None
                 if fd is None:
                     fd = os.open(shard_path, os.O_RDONLY)
                     if shard_fd_cache is not None:
                         shard_fd_cache[shard_path] = fd
-                payload = os.pread(fd, size, offset)
+                    else:
+                        # No caller-owned cache: this fd is ours and must not outlive the read.
+                        owned_fd = fd
+                try:
+                    payload = os.pread(fd, size, offset)
+                finally:
+                    if owned_fd is not None:
+                        os.close(owned_fd)
                 if len(payload) != size:
                     raise RuntimeError(
                         f"Short read from shard {shard_path} frame {_descriptor_member_name(descriptor, frame_idx)}"

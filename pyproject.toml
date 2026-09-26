@@ -24,7 +24,9 @@ requires-python = ">=3.10"
 license = { file = "license.txt" }
 
 [project.optional-dependencies]
-# Standalone rerun-based WebDataset viewer (separate, lighter env). The single-video
+# `rerun` extra: rerun-sdk for an external rerun-based viewer, installed in a separate env.
+# This repository ships no rerun viewer, and the egosmith env pins rerun-sdk==0.23.4 for
+# Any4D (scripts/setup/setup_env.sh), so do not install this extra there. The single-video
 # demo (demo.py) renders with OpenCV, which is already a core dependency, so it needs
 # no extra group here.
 rerun = [
@@ -46,3 +48,7 @@ build-backend = "setuptools.build_meta"
 where = ["src"]
 include = ["lib*", "infiller*", "pypose*"]
 namespaces = true
+
+[tool.setuptools.package-data]
+# Canonical SPDX licence texts attached to LeRobot releases (lib/pipeline/exporters/lerobot_release.py).
+"lib.pipeline.exporters" = ["licenses/*.txt"]

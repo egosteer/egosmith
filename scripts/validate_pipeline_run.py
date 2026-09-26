@@ -6,7 +6,7 @@ import json
 import sys
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 for _p in (str(PROJECT_ROOT / "src"), str(PROJECT_ROOT)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
@@ -21,6 +21,16 @@ def get_parser():
         type=str,
         default=".annotation.json",
         help="Annotation sidecar suffix, e.g. .annotation.json or _qwen-annotation.json",
+    )
+    parser.add_argument(
+        "--require_annotation",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Fail when clips lack a valid annotation (default). With --no-require_annotation (the "
+            "build.require_annotation=false semantics) such clips are reported as warnings, and "
+            "their empty instructions in the built dataset are tolerated."
+        ),
     )
     parser.add_argument("--dataset_dir", type=str, default=None, help="Final dataset shard directory")
     parser.add_argument(
@@ -191,13 +201,17 @@ def validate_manifest_outputs(records, stages):
     return stats
 
 
-def validate_annotations(records, annotation_root, annotation_suffix):
+ANNOTATION_PROBLEM_KEYS = ("missing_annotation", "invalid_json", "invalid_status", "empty_instruction")
+
+
+def validate_annotations(records, annotation_root, annotation_suffix, *, require_annotation: bool = True):
     from lib.pipeline.clips.annotation_protocol import load_clip_annotation
 
     if not annotation_root:
         return None
 
     stats = {
+        "require_annotation": bool(require_annotation),
         "valid": 0,
         "missing_annotation": 0,
         "invalid_json": 0,
@@ -264,11 +278,9 @@ def summarize_validation_failures(summary: dict) -> list[str]:
 
     annotation_stats = summary.get("annotations")
     if annotation_stats:
-        annotation_bad = sum(
-            int(annotation_stats.get(key, 0))
-            for key in ("missing_annotation", "invalid_json", "invalid_status", "empty_instruction")
-        )
-        if annotation_bad > 0:
+        annotation_bad = sum(int(annotation_stats.get(key, 0)) for key in ANNOTATION_PROBLEM_KEYS)
+        # Without require_annotation, build keeps such clips unannotated: a warning, not a failure.
+        if annotation_bad > 0 and annotation_stats.get("require_annotation", True):
             failures.append(f"annotation validation found {annotation_bad} problematic clips")
 
     dataset_stats = summary.get("dataset")
@@ -285,23 +297,45 @@ def main():
     args = get_parser().parse_args()
     from lib.pipeline.clips.clip_manifest import load_clip_manifest
 
-    records = load_clip_manifest(args.descriptor_manifest)
+    all_records = load_clip_manifest(args.descriptor_manifest)
+    records = all_records
     if args.max_clips is not None and int(args.max_clips) > 0:
-        records = records[: args.max_clips]
+        records = all_records[: args.max_clips]
 
     stages = [stage.strip() for stage in args.stages.split(",") if stage.strip()]
+    annotation_stats = validate_annotations(
+        records,
+        args.annotation_root,
+        args.annotation_suffix,
+        require_annotation=bool(args.require_annotation),
+    )
+    allow_empty_instruction = bool(args.allow_empty_instruction)
+    if annotation_stats and not args.require_annotation:
+        # The dataset check scans the built shards, which hold every manifest clip, not only the
+        # first --max_clips: decide the relaxation over the whole manifest.
+        relax_stats = annotation_stats
+        if len(records) != len(all_records):
+            relax_stats = validate_annotations(
+                all_records,
+                args.annotation_root,
+                args.annotation_suffix,
+                require_annotation=False,
+            )
+        if sum(int(relax_stats.get(key, 0)) for key in ANNOTATION_PROBLEM_KEYS) > 0:
+            # Clips kept without an annotation are built with empty instructions by design.
+            allow_empty_instruction = True
     summary = {
         "manifest": {
             "path": str(Path(args.descriptor_manifest).resolve()),
             "clips_checked": len(records),
         },
         "stages": validate_manifest_outputs(records, stages),
-        "annotations": validate_annotations(records, args.annotation_root, args.annotation_suffix),
+        "annotations": annotation_stats,
         "dataset": validate_dataset(
             args.dataset_dir,
             args.dataset_sample_checks,
             decode_images=bool(args.decode_images),
-            allow_empty_instruction=bool(args.allow_empty_instruction),
+            allow_empty_instruction=allow_empty_instruction,
             require_depth=bool(args.require_depth),
         ),
         "depth_action_consistency": validate_depth_action_consistency(

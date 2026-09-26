@@ -50,7 +50,8 @@ class InfillerState:
 
 
 def _use_dpvo_infiller_mode(seq_folder: str) -> bool:
-    """Consistent with lib/stage_runners/hawor_video.py: for dpvo, interpolate the camera per video frame by tstamp."""
+    """Consistent with lib/stage_runners/hawor_video.py: for dpvo, the SLAM export must be dense
+    per video frame (validate_dense_slam_export rejects sparse ones) and is looked up by frame index."""
     if os.environ.get("HAWOR_INFILLER_DPVO_MODE", "").strip() == "1":
         return True
     backend_txt = os.path.join(seq_folder, "SLAM", "slam_backend.txt")
@@ -158,7 +159,8 @@ def _prepare_infiller_window(
 
     frame_start = int(frame_ck[0])
     filling_net_start = max(0, frame_start + start_shift)
-    filling_net_end = min(num_frames - 1, filling_net_start + filling_length)
+    # Exclusive slice end: num_frames (not num_frames - 1) so the last frame is included.
+    filling_net_end = min(num_frames, filling_net_start + filling_length)
     if filling_net_end <= filling_net_start:
         return None
 
@@ -208,7 +210,14 @@ def _flush_infiller_windows(
     pred_hand_pose,
     pred_betas,
     pred_valid,
+    writable_hands=None,
 ):
+    """Run queued infiller windows and write their outputs back in place.
+
+    writable_hands: optional (2,) bool, default all True; hands set False are left
+    untouched and stay invalid. No caller passes it any more: never-observed hands are
+    filled like upstream and restored afterwards in _run_infiller_pass.
+    """
     if not pending_windows:
         return {
             "batch_size": 0,
@@ -237,17 +246,22 @@ def _flush_infiller_windows(
 
     batch_output = batch_output.permute(1, 0, 2).cpu().detach()
 
+    if writable_hands is None:
+        writable_hands = np.ones(2, dtype=bool)
+    writable_hands = np.asarray(writable_hands, dtype=bool).reshape(2)
+
     t_postprocess = time.time()
     for window_idx, window in enumerate(pending_windows):
         output_ck = batch_output[window_idx, : window["t_original"]].reshape(window["t_original"], 2, -1)
         filling_output = filling_postprocess(output_ck, window["transform_w_canon"])
 
         filling_seq = window["filling_seq"]
-        seq_valid = window["seq_valid"]
-        filling_seq["trans"][~seq_valid] = filling_output["trans"][~seq_valid]
-        filling_seq["rot"][~seq_valid] = filling_output["rot"][~seq_valid]
-        filling_seq["hand_pose"][~seq_valid] = filling_output["hand_pose"][~seq_valid]
-        filling_seq["betas"][~seq_valid] = filling_output["betas"][~seq_valid]
+        # Only fill missing frames of hands allowed to be written.
+        fill = ~window["seq_valid"] & writable_hands[:, None]
+        filling_seq["trans"][fill] = filling_output["trans"][fill]
+        filling_seq["rot"][fill] = filling_output["rot"][fill]
+        filling_seq["hand_pose"][fill] = filling_output["hand_pose"][fill]
+        filling_seq["betas"][fill] = filling_output["betas"][fill]
 
         start = window["filling_net_start"]
         end = window["filling_net_end"]
@@ -255,7 +269,7 @@ def _flush_infiller_windows(
         pred_rot[:, start:end] = torch.from_numpy(filling_seq["rot"]).float()
         pred_hand_pose[:, start:end] = torch.from_numpy(filling_seq["hand_pose"]).float()
         pred_betas[:, start:end] = torch.from_numpy(filling_seq["betas"]).float()
-        pred_valid[:, start:end] = True
+        pred_valid[writable_hands, start:end] = True
 
     return {
         "batch_size": batch_size,
@@ -294,8 +308,10 @@ def _prepare_infiller_state_with_cache(
 ):
     slam_path = os.path.join(seq_folder, "SLAM", f"hawor_slam_w_scale_{start_idx}_{end_idx}.npz")
     use_dpvo_infiller = _use_dpvo_infiller_mode(seq_folder)
-    if use_dpvo_infiller and not QUIET_MODE:
-        vprint("[infiller] DPVO: dense per-frame SLAM cameras from hawor_slam_w_scale npz use direct frame lookup")
+    if use_dpvo_infiller:
+        # Validation must run in quiet/batch mode too; only the log line is gated.
+        if not QUIET_MODE:
+            vprint("[infiller] DPVO: dense per-frame SLAM cameras from hawor_slam_w_scale npz use direct frame lookup")
         validate_dense_slam_export(slam_path)
 
     _r_w2c_sla_all, _t_w2c_sla_all, r_c2w_sla_all, t_c2w_sla_all = load_slam_cam(slam_path)
@@ -305,7 +321,7 @@ def _prepare_infiller_state_with_cache(
     pred_hand_pose = torch.zeros(2, num_frames, 45)
     pred_betas = torch.zeros(2, num_frames, 10)
     pred_valid = torch.zeros((2, pred_betas.size(1)))
-    # Sparse traj (DPVO): the video frame index is NOT the traj row index; projection uses interpolation, here max_slam_frames is only an upper bound on video length.
+    # DPVO: the export was validated dense above (one traj row per video frame, sparse exports rejected); max_slam_frames is just the video length, rows are looked up by frame index.
     if use_dpvo_infiller:
         max_slam_frames = num_frames
     else:
@@ -341,7 +357,7 @@ def _project_cam_space_chunks_to_world(state, frame_chunks_all):
         for frame_ck in frame_chunks:
             frame_ck = np.asarray(frame_ck)
             original_key = f"{int(frame_ck[0])}_{int(frame_ck[-1])}"
-            # DPVO: sparse traj, interpolate per video frame by tstamp; upper bound num_frames. Non-DPVO: frame index must fall within the traj row range.
+            # DPVO: dense per-frame traj (validated), direct frame-index lookup clipped to the traj rows; upper bound num_frames. Non-DPVO: frame index must fall within the traj row range.
             upper = state.num_frames if state.use_dpvo_infiller else state.max_slam_frames
             valid_frame_mask = frame_ck < upper
             if valid_frame_mask.sum() == 0:
@@ -382,62 +398,27 @@ def _run_infiller_pass(state, filling_model, src_mask, device, horizon, window_b
     frame_list = torch.tensor(list(range(state.pred_trans.size(1))))
     state.pred_valid = (state.pred_valid > 0).numpy()
     pred_valid_numpy = state.pred_valid
+    # Snapshot which hands were ever observed BEFORE any window is flushed: flushes
+    # mark filled frames valid, which must not turn a never-observed hand "observed".
+    ever_observed = pred_valid_numpy.any(axis=1).copy()
+    # The bimanual infiller anchors each window on a frame where both hands are valid,
+    # so a never-observed hand is still filled while the passes run (as upstream does,
+    # keeping the observed hand's coverage identical to upstream); its original values
+    # and invalid flag are restored afterwards so no hallucinated hand is exported as valid.
+    never_observed_snapshot = {
+        hand: tuple(t[hand].clone() for t in (state.pred_trans, state.pred_rot, state.pred_hand_pose, state.pred_betas))
+        for hand in (0, 1)
+        if not ever_observed[hand]
+    }
     for idx in [1, 0]:
-        observed_count = int(pred_valid_numpy[idx].sum())
-        if observed_count == 0:
-            if not QUIET_MODE:
-                vprint(
-                    f"[infiller] skip {idx_to_hand[idx]} hand: "
-                    "no observed cam-space frames, keep hand invalid instead of hallucinating"
-                )
-            continue
+        # A never-observed hand's pass still runs (its windows also fill the other hand's
+        # gaps, exactly as upstream); only its own values are restored at the end.
         missing = ~pred_valid_numpy[idx]
         frame = frame_list[missing]
         frame_chunks = parse_chunks_hand_frame(frame)
         pending_windows = []
 
-        infiller_debug(f"run infiller on {idx_to_hand[idx]} hand ...")
-        for frame_ck in tqdm(frame_chunks, disable=QUIET_MODE):
-            t_window = time.time()
-            window = _prepare_infiller_window(
-                frame_ck,
-                state.pred_trans,
-                state.pred_rot,
-                state.pred_hand_pose,
-                state.pred_betas,
-                pred_valid_numpy,
-                state.num_frames,
-                filling_length,
-            )
-            timing["prepare_windows"] += time.time() - t_window
-            if window is None:
-                continue
-
-            total_windows += 1
-            pending_windows.append(window)
-            infiller_debug(
-                f"queue infiller window {window['filling_net_start']} to "
-                f"{min(state.num_frames - 1, window['filling_net_start'] + filling_length)}"
-            )
-
-            if len(pending_windows) >= window_batch_size:
-                flush_stats = _flush_infiller_windows(
-                    pending_windows,
-                    filling_model,
-                    src_mask,
-                    device,
-                    horizon,
-                    state.pred_trans,
-                    state.pred_rot,
-                    state.pred_hand_pose,
-                    state.pred_betas,
-                    pred_valid_numpy,
-                )
-                timing["model_forward"] += float(flush_stats["forward_time"])
-                timing["postprocess"] += float(flush_stats["postprocess_time"])
-                pending_windows = []
-
-        if pending_windows:
+        def flush_pending():
             flush_stats = _flush_infiller_windows(
                 pending_windows,
                 filling_model,
@@ -452,6 +433,60 @@ def _run_infiller_pass(state, filling_model, src_mask, device, horizon, window_b
             )
             timing["model_forward"] += float(flush_stats["forward_time"])
             timing["postprocess"] += float(flush_stats["postprocess_time"])
+            pending_windows.clear()
+
+        infiller_debug(f"run infiller on {idx_to_hand[idx]} hand ...")
+        for frame_ck in tqdm(frame_chunks, disable=QUIET_MODE):
+            t_window = time.time()
+            window = _prepare_infiller_window(
+                frame_ck,
+                state.pred_trans,
+                state.pred_rot,
+                state.pred_hand_pose,
+                state.pred_betas,
+                pred_valid_numpy,
+                state.num_frames,
+                filling_length,
+            )
+            # Upstream runs these windows one at a time, each seeing the previous window's
+            # writes. A window prepared from pre-flush state is identical to that only if its
+            # anchor search and span stay clear of every queued window; otherwise flush first
+            # and re-prepare so batching never changes the result.
+            if window is not None and pending_windows and window["filling_net_start"] < max(
+                queued["filling_net_end"] for queued in pending_windows
+            ):
+                flush_pending()
+                window = _prepare_infiller_window(
+                    frame_ck,
+                    state.pred_trans,
+                    state.pred_rot,
+                    state.pred_hand_pose,
+                    state.pred_betas,
+                    pred_valid_numpy,
+                    state.num_frames,
+                    filling_length,
+                )
+            timing["prepare_windows"] += time.time() - t_window
+            if window is None:
+                continue
+
+            total_windows += 1
+            pending_windows.append(window)
+            infiller_debug(
+                f"queue infiller window {window['filling_net_start']} to "
+                f"{window['filling_net_end'] - 1}"
+            )
+
+            if len(pending_windows) >= window_batch_size:
+                flush_pending()
+
+        if pending_windows:
+            flush_pending()
+
+    for hand, originals in never_observed_snapshot.items():
+        for tensor, original in zip((state.pred_trans, state.pred_rot, state.pred_hand_pose, state.pred_betas), originals):
+            tensor[hand] = original
+        pred_valid_numpy[hand] = False
 
     return total_windows, timing
 

@@ -43,7 +43,12 @@ def validate_dense_slam_export(fpath):
         np.int64
     ).reshape(-1)
 
-    dense_by_video_frame = pred_traj.shape[0] != tstamp.shape[0]
+    # Dense exports carry one pose per video frame plus keyframe tstamps, which must
+    # index into that per-frame trajectory; a shorter traj whose tstamps point past
+    # its end is a sparse keyframe export, not a dense one.
+    dense_by_video_frame = pred_traj.shape[0] != tstamp.shape[0] and (
+        tstamp.size == 0 or (int(tstamp.min()) >= 0 and int(tstamp.max()) < pred_traj.shape[0])
+    )
     dense_by_contiguous_tstamp = pred_traj.shape[0] == tstamp.shape[0] and np.array_equal(
         tstamp,
         np.arange(pred_traj.shape[0], dtype=np.int64),

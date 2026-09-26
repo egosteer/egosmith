@@ -41,10 +41,18 @@ def batched_hawor_inference(
     num_workers=16,
     output_device='cpu',
     return_perf=False,
+    chunk_boundaries=None,
 ):
     """Run HAWOR over ``frame_indices`` and return per-frame predictions.
 
     Args mirror the original ``HAWOR.inference`` (``model`` replaces ``self``).
+    ``chunk_boundaries`` (optional) lists the cumulative start offsets of the
+    concatenated temporal chunks, e.g. ``[0, n0, n0 + n1, ..., len(frame_indices)]``.
+    When given, each chunk is padded to a multiple of ``seq_len`` on its own (by
+    repeating its last frame, as upstream ``HAWOR.inference`` does per chunk), so
+    no temporal window mixes frames from different chunks; padded positions are
+    dropped and outputs keep the input order and length. When omitted, the whole
+    sequence is windowed as one chunk (legacy behavior).
     Returns a dict with pred_cam / pred_pose / pred_shape / pred_rotmat /
     pred_trans (+ img_focal / img_center, and ``_perf`` timings if requested).
     """
@@ -66,13 +74,26 @@ def batched_hawor_inference(
             'img_center': img_center,
         }
 
-    # Pad dataset to a multiple of seq_len so every window is full.
-    remainder = total_frames % seq_len
-    if remainder != 0:
-        pad_size = seq_len - remainder
-        padded_indices = list(range(total_frames)) + [total_frames - 1] * pad_size
+    # Pad to a multiple of seq_len so every window is full. With chunk boundaries,
+    # each chunk is padded separately so windows never straddle a chunk gap.
+    if chunk_boundaries is None:
+        segments = [(0, total_frames)]
     else:
-        padded_indices = list(range(total_frames))
+        bounds = [int(b) for b in chunk_boundaries]
+        if bounds[0] != 0 or bounds[-1] != total_frames or any(b1 <= b0 for b0, b1 in zip(bounds, bounds[1:])):
+            raise ValueError(
+                f"chunk_boundaries must increase strictly from 0 to {total_frames}, got {chunk_boundaries}"
+            )
+        segments = list(zip(bounds[:-1], bounds[1:]))
+    padded_indices = []
+    keep_positions = []  # position in padded order of each original frame, in input order
+    for seg_start, seg_end in segments:
+        keep_positions.extend(range(len(padded_indices), len(padded_indices) + seg_end - seg_start))
+        padded_indices.extend(range(seg_start, seg_end))
+        remainder = (seg_end - seg_start) % seq_len
+        if remainder != 0:
+            padded_indices.extend([seg_end - 1] * (seq_len - remainder))
+    keep_is_prefix = keep_positions == list(range(total_frames))
     total_padded = len(padded_indices)
     dataloader_batch_size = chunk_batch_size * seq_len
 
@@ -101,17 +122,38 @@ def batched_hawor_inference(
                 tensors[key] = torch.stack(vals)
         return tensors
 
+    prefetch_error = []
+    stop_event = threading.Event()
+
+    def _put_interruptible(item):
+        # Retry in short slices so the producer bails out (instead of blocking
+        # forever) once the consumer has stopped, e.g. after a forward error.
+        while not stop_event.is_set():
+            try:
+                prefetch_q.put(item, timeout=0.5)
+                return True
+            except queue.Full:
+                continue
+        return False
+
     def _prefetch_worker():
         pool = ThreadPoolExecutor(max_workers=load_workers)
         try:
             for start, end in batch_ranges:
+                if stop_event.is_set():
+                    break
                 indices = [padded_indices[i] for i in range(start, end)]
                 items = list(pool.map(db.__getitem__, indices))
-                prefetch_q.put((_collate(items), end - start))
+                if not _put_interruptible((_collate(items), end - start)):
+                    break
                 del items
+        except Exception as error:
+            prefetch_error.append(error)
         finally:
             pool.shutdown(wait=False)
-        prefetch_q.put(None)
+            # Always wake the consumer, including after a loader exception;
+            # the consumer re-raises prefetch_error when it sees the sentinel.
+            _put_interruptible(None)
 
     loader_thread = threading.Thread(target=_prefetch_worker, daemon=True)
     loader_thread.start()
@@ -132,48 +174,59 @@ def batched_hawor_inference(
         'concat_sec': 0.0,
     }
 
-    while True:
-        t_wait = time.time()
-        item = prefetch_q.get()
-        perf['wait_prefetch_sec'] += time.time() - t_wait
-        if item is None:
-            break
-        batch_tensors, current_batch_size = item
-        current_chunks = current_batch_size // seq_len
-        perf['batch_count'] += 1
+    try:
+        while True:
+            t_wait = time.time()
+            item = prefetch_q.get()
+            perf['wait_prefetch_sec'] += time.time() - t_wait
+            if item is None:
+                if prefetch_error:
+                    raise prefetch_error[0]
+                break
+            batch_tensors, current_batch_size = item
+            current_chunks = current_batch_size // seq_len
+            perf['batch_count'] += 1
 
-        batch = {}
-        t_h2d = time.time()
-        for k, v in batch_tensors.items():
-            shaped = v.view(current_chunks, seq_len, *v.shape[1:])
-            if use_non_blocking and shaped.device.type == 'cpu':
-                shaped = shaped.pin_memory()
-            batch[k] = shaped.to(device, non_blocking=use_non_blocking)
-        perf['host_to_device_sec'] += time.time() - t_h2d
-        del batch_tensors
+            batch = {}
+            t_h2d = time.time()
+            for k, v in batch_tensors.items():
+                shaped = v.view(current_chunks, seq_len, *v.shape[1:])
+                if use_non_blocking and shaped.device.type == 'cpu':
+                    shaped = shaped.pin_memory()
+                batch[k] = shaped.to(device, non_blocking=use_non_blocking)
+            perf['host_to_device_sec'] += time.time() - t_h2d
+            del batch_tensors
 
-        t_forward = time.time()
-        with torch.inference_mode():
-            output = model.forward(batch)
-            out = output['out']
-        perf['forward_sec'] += time.time() - t_forward
+            t_forward = time.time()
+            with torch.inference_mode():
+                output = model.forward(batch)
+                out = output['out']
+            perf['forward_sec'] += time.time() - t_forward
 
-        expected = current_batch_size
-        out = {k: v[:expected] for k, v in out.items()}
+            expected = current_batch_size
+            out = {k: v[:expected] for k, v in out.items()}
 
-        pred_cam.append(out['pred_cam'])
-        pred_pose.append(out['pred_pose'])
-        pred_shape.append(out['pred_shape'])
-        pred_rotmat.append(out['pred_rotmat'])
-        pred_trans.append(out['trans_full'])
+            pred_cam.append(out['pred_cam'])
+            pred_pose.append(out['pred_pose'])
+            pred_shape.append(out['pred_shape'])
+            pred_rotmat.append(out['pred_rotmat'])
+            pred_trans.append(out['trans_full'])
+    finally:
+        # Stop the loader if we exit early (e.g. a forward error) so it cannot
+        # stay parked on a full queue.
+        stop_event.set()
 
     # Concatenate on GPU, then transfer to CPU once.
     t_concat = time.time()
-    pred_cam = torch.cat(pred_cam, dim=0)[:total_frames]
-    pred_pose = torch.cat(pred_pose, dim=0)[:total_frames]
-    pred_shape = torch.cat(pred_shape, dim=0)[:total_frames]
-    pred_rotmat = torch.cat(pred_rotmat, dim=0)[:total_frames]
-    pred_trans = torch.cat(pred_trans, dim=0)[:total_frames]
+    if keep_is_prefix:
+        keep = slice(0, total_frames)
+    else:
+        keep = torch.as_tensor(keep_positions, dtype=torch.long, device=pred_cam[0].device)
+    pred_cam = torch.cat(pred_cam, dim=0)[keep]
+    pred_pose = torch.cat(pred_pose, dim=0)[keep]
+    pred_shape = torch.cat(pred_shape, dim=0)[keep]
+    pred_rotmat = torch.cat(pred_rotmat, dim=0)[keep]
+    pred_trans = torch.cat(pred_trans, dim=0)[keep]
     perf['concat_sec'] += time.time() - t_concat
 
     if output_device is not None:

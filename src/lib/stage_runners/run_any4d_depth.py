@@ -209,7 +209,8 @@ def run_any4d_depth_batch(
 
     depth_list = []
     for target_i in range(len(frame_indices)):
-        view_idx = 1 + target_i
+        # Outputs are pred1..predN for views [ref, target_0, ...]: target_i is pred{2 + target_i}.
+        view_idx = 2 + target_i
         depth_z = (
             pred_result[f"pred{view_idx}"]["pts3d_cam"][..., 2:3][0]
             .squeeze(-1)

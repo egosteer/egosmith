@@ -32,11 +32,19 @@ annotation:
     --prompt_file {project_root}/src/lib/annotation/prompts/without_clip/annotation_general_egocentric.txt
     --workers 4
     --target_fps 5.0
+build:
+  annotation_suffix: _qwen-annotation.json   # must match --annotation_suffix above
 ```
 ```bash
 export DASHSCOPE_API_KEY=sk-...
 python scripts/run_dataset_pipeline.py --config configs/my_video.yaml
 ```
+
+`filter`, `build` and `validate` look for `<clip_id><build.annotation_suffix>` only (default
+`.annotation.json`), so keep `build.annotation_suffix` equal to the suffix the command writes —
+otherwise the sidecars are silently ignored. For the API clip modes (`clip.mode: api`,
+`api_annotation` or `semantic_api`), an unset `build.annotation_suffix` inherits
+`clip.annotation_suffix` automatically.
 
 The command is a template; the orchestrator substitutes these variables before running it:
 
@@ -50,8 +58,11 @@ The command is a template; the orchestrator substitutes these variables before r
 | `{project_root}` | repo root |
 
 Useful `api_annotation.py` flags: `--prompt_file`, `--model`, `--workers`, `--target_fps`,
-`--max_clips` / `--clip_ids` (testing subset), `--resume` (skip existing sidecars), `--dry_run`
-(skip API calls).
+`--max_clips` / `--clip_ids` (testing subset), `--resume` / `--no-resume` (on by default: a clip whose
+sidecar file already exists is skipped whatever its content; pass `--no-resume` to re-annotate), `--dry_run`
+(skip API calls), `--max_api_retries` (default 5: retries per clip, with exponential backoff, after a
+rate-limited (429) or raising API call). A clip whose retries are exhausted is counted as `failed`
+in the report, and the script exits with code 1 when any clip failed.
 
 ## Two ways to annotate
 
@@ -69,7 +80,7 @@ Built-in prompts under `src/lib/annotation/prompts/`:
 - `with_clip/annotation_general_clip.txt` — segment a raw video **and** annotate (for `clip.mode: api`)
 
 Point `--prompt_file` (or `clip.prompt_file`) at any of these or your own. Always pass an explicit
-prompt path. To emit other languages (e.g. Chinese instructions), write a custom prompt that asks the
+prompt path: without `--prompt_file`, `api_annotation.py` uses the industrial/workshop variant. To emit other languages (e.g. Chinese instructions), write a custom prompt that asks the
 model for them — the system is language-agnostic; only the prompt controls the output language.
 
 ## Output: annotation sidecars
@@ -94,7 +105,9 @@ is a single representative string. The `build` stage copies `instruction` / `ins
 
 ### Attaching pre-made annotations (no API call)
 
-Place sidecars under `paths.annotation_root` before `build` and set `build.annotation_suffix` to
+Place sidecars under the annotation root before `build` — `paths.annotation_root` in a nested
+(`dataset:` / `paths:`) config, `annotation.root` in a single-video (`video:`) config, which rejects a
+`paths` block — and set `build.annotation_suffix` to
 match `<clip_id><suffix>`. With `build.require_annotation: false`, clips without a sidecar are still
 exported (empty instruction fields).
 

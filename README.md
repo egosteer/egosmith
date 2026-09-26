@@ -17,9 +17,9 @@
   <img src="assets/teaser.png" width="100%">
 </p>
 
-Our **full-stack system** integrates [EgoSmith](https://github.com/egosteer/egosmith) (this repo), [Robot Stack](https://github.com/egosteer/robot-stack), and [EgoSteer](https://github.com/egosteer/egosteer) to learn from large-scale egocentric human videos and facilitate data-efficient real-robot post-training, enabling steerable dexterous manipulation across over 40 tasks alongside few-shot adaptation to complex, long-horizon tasks.
+Our **full-stack system** integrates [EgoSmith](https://github.com/egosteer/egosmith) (this repo), [Robot Stack](https://github.com/egosteer/robot-stack), and [EgoSteer](https://github.com/egosteer/egosteer) to learn from large-scale egocentric human videos and facilitate data-efficient real-robot post-training, enabling steerable dexterous manipulation across 45 tasks alongside few-shot adaptation to complex, long-horizon tasks.
 
-This repository is **EgoSmith**, an egocentric data pipeline that curates in-the-wild **egocentric videos** into clean, fully-annotated training data for steerable **dexterous manipulation**. It runs **~9× faster than HaWoR** through window batching and overlapped
+This repository is **EgoSmith**, an egocentric data pipeline that curates in-the-wild **egocentric videos** into clean, fully-annotated training data for steerable **dexterous manipulation**. It runs **~8.3× faster than HaWoR** through window batching and overlapped
 CPU-decode / GPU-compute.
 
 We release EgoSmith annotations in LeRobot v3 format, including hand poses,
@@ -55,7 +55,7 @@ EgoSmith runs in a single conda env named `egosmith`.
 
 ```bash
 # 1. Environment (CUDA 12.8 + Torch 2.8 + DPVO source build; idempotent).
-export CUDA_HOME=/usr/local/cuda-12.8        # point at your toolkit
+#    Installs cuda-toolkit 12.8 into the env and builds DPVO with CUDA_HOME=$CONDA_PREFIX.
 bash scripts/setup/setup_env.sh
 conda activate egosmith
 
@@ -100,9 +100,12 @@ and resize them to `calibration/head_image_size`.
 Labels are sampled at 30 fps. `source_frame_observed` distinguishes directly
 observed labels from labels interpolated between observed frames.
 
-By default, hand poses are expressed in the current frame's head-camera
-coordinates. Actions describe the next-frame hand pose in that same
-coordinate frame.
+Each release records its hand-pose coordinate frame as `hand_frame` in
+`meta/egosmith_provenance.json`. With `camera`, hand poses are expressed in the
+current frame's head-camera coordinates; with `world`, they are in the episode's
+SLAM world frame and the per-frame world-to-camera matrix maps them into the
+current frame's head camera. Actions describe the next-frame hand pose in the
+same frame as the state. The converter in this repository defaults to `world`.
 
 ### Loading annotations
 
@@ -117,7 +120,7 @@ sample = dataset[0]
 
 sample["observation.state"]   # [74]
 sample["action"]              # [74]
-sample["task"]                # Language instruction
+sample["task"]                # Dataset name; instructions are in the episode metadata
 sample["source_frame_index"]  # Frame index in the original media
 ```
 
@@ -131,8 +134,15 @@ source-media access instructions and license terms.
 ```bash
 # configs/my_video.yaml:
 #   video: /path/to/input.mp4
+export HAWOR_BATCH_TMPDIR=/large/disk/tmp   # required: stage-3 scratch root (or HAWOR_STAGE3_TMP_ROOT)
 python scripts/run_dataset_pipeline.py --config configs/my_video.yaml
 ```
+
+The SLAM stage materializes many GB of frames into a scratch root that is never defaulted; set
+`HAWOR_STAGE3_TMP_ROOT` or `HAWOR_BATCH_TMPDIR` (or `infer.slam.stage3_tmp_root` in the config),
+otherwise the preflight aborts the run before frame extraction. The preflight runs after the
+optional `clip` step of `prepare`, so a configured `clip.mode` (including paid API clipping) runs
+before these checks.
 
 This extracts frames, runs the HaWoR / DPVO / Any4D stages, filters, builds the WebDataset, and
 validates the outputs. Language annotation is optional, so empty instruction fields are valid here.
@@ -172,13 +182,12 @@ Start here, then follow the guide for what you want to do:
 
 ## Repository layout
 
-- `src/`: source code: `lib` (the pipeline: stages, filtering, WebDataset build, viewer), plus the
+- `src/`: source code: `lib` (the pipeline: stages, filtering, WebDataset build, LeRobot export), plus the
   obtained HaWoR codebase (`infiller` / `hawor`).
-- `scripts/`: entrypoints: `run_dataset_pipeline.py`, `batch_infer.py`, plus `setup/`, `build/`,
-  `inspection/`.
+- `scripts/`: entrypoints: `run_dataset_pipeline.py`, `batch_infer.py`, plus `setup/`, `build/`.
 - `configs/`: example configs.
 - `docs/`: the guides linked above.
-- `thirdparty/`: vendored DPVO, plus the `Any4D` and `hawor_upstream` submodules.
+- `thirdparty/`: vendored DPVO and Any4D, plus the `hawor_upstream` and `chumpy_upstream` submodules.
 
 ## Acknowledgements
 

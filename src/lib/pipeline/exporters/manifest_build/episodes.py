@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 import tarfile
+from concurrent.futures import ProcessPoolExecutor
 from multiprocessing import get_context
 from pathlib import Path
 
@@ -17,6 +18,7 @@ from lib.pipeline.clips.annotation_protocol import build_annotation_issue_from_c
 from lib.pipeline.clips.clip_manifest import ClipManifestRecord, load_clip_manifest
 from lib.pipeline.slam.depth_artifacts import load_export_depths
 from lib.pipeline.hands.hand_depth_align import HandDepthAlignConfig
+from lib.pipeline.io import result_io
 from lib.pipeline.io.frame_sources import build_frame_bytes_reader, classify_descriptor_storage, validate_descriptor_for_frame_reads
 from lib.pipeline.exporters.mano_codec import build_mano_pca_frame_features
 from lib.pipeline.exporters.webdataset_features import (
@@ -36,7 +38,7 @@ from lib.pipeline.quality.quality_metrics import (
     validate_lowdim_numeric_sanity,
 )
 
-from .cache import load_cached_features, write_cached_features
+from .cache import feature_cache_dependencies, load_cached_features, write_cached_features
 from .resample import resample_episode_features
 
 
@@ -202,6 +204,15 @@ def load_descriptor_episode_features(
 ):
     seq_folder = ep["seq_folder"]
     descriptor = ep.get("descriptor")
+    cache_dependencies = None
+    if feature_cache_dir:
+        native = descriptor is not None and descriptor_uses_native_features(descriptor)
+        cache_dependencies = feature_cache_dependencies(
+            seq_folder,
+            extra_files=(getattr(descriptor, "shard_path", None),) if native else (),
+            include_mano_assets=True,
+            mano_dir=mano_dir,
+        )
     requested_export_frame_count = ep.get("num_valid_frames")
     if requested_export_frame_count is None and "frame_end" in ep:
         requested_export_frame_count = int(ep["frame_end"] - ep.get("frame_start", 0))
@@ -215,6 +226,7 @@ def load_descriptor_episode_features(
                 source_fps=source_fps,
                 target_fps=target_fps,
                 interpolate_labels=interpolate_labels,
+                dependencies=cache_dependencies,
             )
             if feature_cache_dir
             else None
@@ -249,6 +261,7 @@ def load_descriptor_episode_features(
             source_fps=source_fps,
             target_fps=target_fps,
             interpolate_labels=interpolate_labels,
+            dependencies=cache_dependencies,
         )
         return episode_data
 
@@ -299,6 +312,7 @@ def load_descriptor_episode_features(
             source_fps=source_fps,
             target_fps=target_fps,
             interpolate_labels=interpolate_labels,
+            dependencies=cache_dependencies,
         )
         if feature_cache_dir
         else None
@@ -375,6 +389,7 @@ def load_descriptor_episode_features(
         source_fps=source_fps,
         target_fps=target_fps,
         interpolate_labels=interpolate_labels,
+        dependencies=cache_dependencies,
     )
     return episode_data
 
@@ -516,12 +531,13 @@ def _prepare_manifest_episode(
             "language": language,
         }, None, annotation_issue
 
-    world_res_path = seq_folder / "world_space_res.pth"
-    if not world_res_path.exists():
+    # Either the consolidated result.npz or the legacy world_space_res.pth is accepted
+    # (batch_infer's default cleanup removes the .pth once result.npz is written).
+    if not result_io.final_artifact_exists(seq_folder):
         return None, "missing_world_res", None
 
     try:
-        pred_trans, *_ = joblib.load(world_res_path)
+        pred_trans, *_ = result_io.load_pose_arrays(seq_folder)
     except Exception:
         return None, "invalid_world_res", None
 
@@ -643,7 +659,7 @@ def load_manifest_record_prediction(record: ClipManifestRecord):
         return None, "native_features"
     seq_folder = Path(record.descriptor.seq_folder)
     world_res_path = seq_folder / "world_space_res.pth"
-    if not world_res_path.exists():
+    if not result_io.final_artifact_exists(seq_folder):
         return None, "missing_world_res"
     prediction = _load_world_space_prediction({"episode_id": record.clip_id}, str(world_res_path))
     if prediction is None:
@@ -711,8 +727,10 @@ def prepare_manifest_episodes(
         )
     else:
         mp_context = get_context()
-        pool = mp_context.Pool(preprocess_workers)
-        iterator = pool.imap(
+        # ProcessPoolExecutor, not multiprocessing.Pool: an OOM-killed worker raises BrokenProcessPool
+        # instead of hanging; map() keeps the input order like Pool.imap.
+        pool = ProcessPoolExecutor(max_workers=preprocess_workers, mp_context=mp_context)
+        iterator = pool.map(
             _prepare_manifest_episode_star,
             (
                 (
@@ -755,8 +773,7 @@ def prepare_manifest_episodes(
             stats["kept"] += 1
     finally:
         if preprocess_workers > 1:
-            pool.close()
-            pool.join()
+            pool.shutdown(wait=True, cancel_futures=True)
 
     stats["annotation_issue_count"] = len(annotation_issues)
     return episodes, stats, annotation_issues

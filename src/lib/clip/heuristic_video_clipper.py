@@ -22,8 +22,9 @@ import yaml
 from tqdm import tqdm
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
+for _p in (str(PROJECT_ROOT / "src"), str(PROJECT_ROOT)):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 from lib.clip.clip_config import get_pipeline_config  # noqa: E402
 
@@ -409,6 +410,30 @@ def _safe_stem(path: Path) -> str:
     return "".join(ch if ch.isalnum() or ch in {"-", "_", "."} else "_" for ch in path.stem).strip("._") or "clip"
 
 
+def _check_output_stem_collisions(videos: list[Path], source_root: Path | None) -> None:
+    """Refuse inputs whose clips would share names: clips are named from the sanitized stem only.
+
+    The key is the flattened clip-id prefix (relative parent parts + sanitized stem joined with
+    ``__``, as clip ids and annotation sidecars are named downstream), so ``a/b.mp4`` and
+    ``a__b.mp4`` collide too, not only same-directory stems."""
+    groups: dict[str, list[Path]] = {}
+    for video_path in videos:
+        rel_parent = Path()
+        if source_root and video_path.is_relative_to(source_root):
+            rel_parent = video_path.relative_to(source_root).parent
+        members = groups.setdefault("__".join((*rel_parent.parts, _safe_stem(video_path))), [])
+        if video_path not in members:
+            members.append(video_path)
+    conflicts = [members for members in groups.values() if len(members) > 1]
+    if conflicts:
+        lines = "\n".join("  " + ", ".join(str(path) for path in members) for members in conflicts)
+        raise ValueError(
+            "Input videos would write clips with the same names or clip ids (same file stem after "
+            "sanitizing, or the same id once the relative directory is flattened with '__'); "
+            f"rename them so their clip ids differ:\n{lines}"
+        )
+
+
 def write_video_clip(source_video: str | Path, output_path: str | Path, interval: ClipInterval, *, output_size=None) -> dict:
     import cv2
 
@@ -455,13 +480,14 @@ def run_heuristic_clipping(
     output_root = Path(output_root).expanduser().resolve()
     output_root.mkdir(parents=True, exist_ok=True)
     source_root_path = Path(source_root).expanduser().resolve() if source_root else None
+    videos = [Path(path).expanduser().resolve() for path in video_paths]
+    _check_output_stem_collisions(videos, source_root_path)
     paths_cfg = config.get("paths") or {}
     heuristic = _heuristic_section(config)
     model = _load_yolo(paths_cfg.get("model_path") or heuristic.get("model_path"))
     fallback_full_video = bool(heuristic.get("fallback_full_video", False))
     output_size = heuristic.get("output_size")
 
-    videos = [Path(path).expanduser().resolve() for path in video_paths]
     records = []
     for video_path in tqdm(videos, desc="Heuristic clipping"):
         intervals, metrics = analyze_video_intervals(video_path, config, model=model)

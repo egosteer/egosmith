@@ -201,6 +201,25 @@ def _query_cuda(timeout: float = 60.0):
         return None
 
 
+def _parent_visible_gpu_ids() -> Optional[List[int]]:
+    """Physical GPU ids listed in this process's CUDA_VISIBLE_DEVICES.
+
+    ``None`` when the variable is unset/empty or not a plain list of integer ids
+    (e.g. GPU UUIDs / MIG handles), in which case callers fall back to the
+    visible device count.
+    """
+    raw = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if raw is None:
+        return None
+    tokens = [token.strip() for token in raw.split(",") if token.strip()]
+    if not tokens:
+        return None
+    try:
+        return [int(token) for token in tokens]
+    except ValueError:
+        return None
+
+
 def check_gpu(report: PreflightReport, gpus) -> None:
     indices = _parse_gpu_indices(gpus)
     probe = _query_cuda()
@@ -219,7 +238,19 @@ def check_gpu(report: PreflightReport, gpus) -> None:
             "check drivers / CUDA_VISIBLE_DEVICES",
         )
         return
+    # ``--gpus`` holds physical ids: each worker exports CUDA_VISIBLE_DEVICES=<id>
+    # (batch/worker_pool.py). When the parent already restricts visibility, the
+    # requested ids must belong to that visible list, not be < device_count.
+    visible_ids = _parent_visible_gpu_ids()
     for idx in indices:
+        if visible_ids is not None:
+            if idx not in visible_ids:
+                report.add(
+                    "gpu",
+                    f"requested GPU {idx} is not in CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')}",
+                    "--gpus takes physical GPU ids; pick ids from CUDA_VISIBLE_DEVICES",
+                )
+            continue
         if idx >= device_count:
             report.add(
                 "gpu",
@@ -294,9 +325,16 @@ def collect_batch_weights(project_root: Path, args) -> dict:
     weights: dict = {}
     if "detect_track" in stages:
         weights["detector"] = project_root / "weights" / "external" / "detector.pt"
-    if {"motion", "infiller"} & set(stages):
-        weights["hawor checkpoint"] = getattr(args, "checkpoint", None)
-        weights["hawor model_config"] = project_root / "weights" / "hawor" / "model_config.yaml"
+    if "motion" in stages:
+        # Only the motion stage loads the HaWoR backbone; its model_config.yaml is
+        # read from <checkpoint>/../../ (see stages/hawor_runtime.py).
+        checkpoint = getattr(args, "checkpoint", None)
+        weights["hawor checkpoint"] = checkpoint
+        weights["hawor model_config"] = (
+            Path(checkpoint).parent.parent / "model_config.yaml"
+            if checkpoint
+            else project_root / "weights" / "hawor" / "model_config.yaml"
+        )
     if "infiller" in stages:
         weights["infiller weight"] = getattr(args, "infiller_weight", None)
     if "slam" in stages:

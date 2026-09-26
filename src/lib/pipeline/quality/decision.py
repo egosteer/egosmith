@@ -9,6 +9,9 @@ from .thresholds import _camera_space_axis_abs_cap_bounds
 def _camera_space_bounds_exceeded(metrics: dict, prefix: str, bounds: dict | None) -> bool:
     if not bounds:
         return False
+    # No present hand in any frame -> the camera-space extents are placeholders, not measurements.
+    if metrics.get("camera_space_hand_frames", 1) == 0:
+        return False
     for axis in CAMERA_AXES:
         axis_bounds = bounds.get(axis)
         if not axis_bounds:
@@ -104,6 +107,10 @@ def decide_clip_quality(
         and metrics.get("max_wrist_rotation_step", 0.0) > criteria["max_wrist_rotation_step"]
     ):
         reasons.append("wrist_rotation_step_exceeded")
+    # No present hand in any frame: every camera-space check below would compare placeholders,
+    # so reject explicitly instead (legacy metrics without the counter are unaffected).
+    if metrics.get("camera_space_hand_frames", 1) == 0:
+        reasons.append("no_present_hand_frames")
     if (
         criteria.get("max_camera_space_wrist_abs") is not None
         and metrics["max_camera_space_wrist_abs"] > criteria["max_camera_space_wrist_abs"]

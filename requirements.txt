@@ -2,8 +2,8 @@
 # (prepare / infer / filter / build / validate) and batch inference.
 #
 # The single-video demo (demo.py) renders with OpenCV (opencv-python below), so it
-# needs nothing extra. The optional rerun-based WebDataset viewer is a separate group
-# (see the `rerun` extra in pyproject.toml).
+# needs nothing extra. No rerun-based viewer ships with this repository; the rerun-sdk
+# that Any4D needs is installed with --no-deps by scripts/setup/setup_env.sh.
 #
 # Keep modern NumPy 1.x. Legacy MANO pickles import chumpy; use the patched
 # chumpy source below instead of downgrading NumPy.

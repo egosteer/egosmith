@@ -287,7 +287,7 @@ def detect_track(
     return boxes_, tracks
 
 
-def validate_motion_velocity(bboxes, max_relative_velocity=3.0):
+def validate_motion_velocity(bboxes, max_relative_velocity=3.0, frames=None):
     """
     Validate motion velocity to detect physically implausible movements.
     Uses relative velocity (movement relative to bbox size) instead of absolute pixels.
@@ -295,6 +295,8 @@ def validate_motion_velocity(bboxes, max_relative_velocity=3.0):
     Args:
         bboxes: (T, 5) array of [x1, y1, x2, y2, conf]
         max_relative_velocity: Maximum movement as multiple of bbox diagonal per frame
+        frames: optional (T,) frame numbers of the rows; a track lists only detected frames, so
+            displacement across a gap is divided by the number of frames it spans
 
     Returns:
         valid_mask: Boolean array indicating valid frames
@@ -321,6 +323,8 @@ def validate_motion_velocity(bboxes, max_relative_velocity=3.0):
     relative_velocities = np.zeros(T - 1)
     valid_diag_mask = avg_diagonals > 0
     relative_velocities[valid_diag_mask] = displacements[valid_diag_mask] / avg_diagonals[valid_diag_mask]
+    if frames is not None:
+        relative_velocities /= np.maximum(np.diff(np.asarray(frames, dtype=np.float64)), 1.0)
 
     # Mark frames with excessive relative velocity as invalid
     valid = np.ones(T, dtype=bool)
@@ -329,13 +333,16 @@ def validate_motion_velocity(bboxes, max_relative_velocity=3.0):
     return valid
 
 
-def interpolate_bboxes(bboxes, max_size_change_ratio=2.5):
+def interpolate_bboxes(bboxes, max_size_change_ratio=2.5, frames=None):
     """
     Interpolate missing bboxes with size consistency validation.
 
     Args:
         bboxes: (T, 5) array of [x1, y1, x2, y2, conf]
         max_size_change_ratio: Maximum allowed size change between adjacent frames
+        frames: optional (T,) frame numbers of the rows. A track lists only detected frames, so
+            rows are compared only when their frames are adjacent and are interpolated over frame
+            numbers (a hand leaving and re-entering the view is not a size jump)
     """
     T = bboxes.shape[0]
 
@@ -353,6 +360,9 @@ def interpolate_bboxes(bboxes, max_size_change_ratio=2.5):
         for i in range(len(non_zero_indices) - 1):
             curr_idx = non_zero_indices[i]
             next_idx = non_zero_indices[i + 1]
+
+            if frames is not None and frames[next_idx] - frames[curr_idx] > 1:
+                continue
 
             curr_area = areas[curr_idx]
             next_area = areas[next_idx]
@@ -378,9 +388,10 @@ def interpolate_bboxes(bboxes, max_size_change_ratio=2.5):
     if len(zero_indices) == 0 or len(non_zero_indices) == 0:
         return bboxes
 
+    x = np.arange(T) if frames is None else np.asarray(frames, dtype=np.float64)
     interpolated_bboxes = bboxes.copy()
     for i in range(5):
-        interp_func = interp1d(non_zero_indices, bboxes[non_zero_indices, i], kind='linear', fill_value="extrapolate")
-        interpolated_bboxes[zero_indices, i] = interp_func(zero_indices)
+        interp_func = interp1d(x[non_zero_indices], bboxes[non_zero_indices, i], kind='linear', fill_value="extrapolate")
+        interpolated_bboxes[zero_indices, i] = interp_func(x[zero_indices])
 
     return interpolated_bboxes

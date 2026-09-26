@@ -146,6 +146,11 @@ def main() -> int:
         if args.resume and world_res_path.is_file() and done_marker.exists():
             skipped += 1
             continue
+        if not args.resume:
+            # Forced re-run (--no-resume): drop this clip's stale 0-byte .infiller.done marker first so
+            # a failure in this run cannot be read back as "completed" from the previous run's marker.
+            # It is re-created by _write_world_res once the new world_space_res.pth is written.
+            done_marker.unlink(missing_ok=True)
         try:
             _write_world_res(record, args, device=device)
             completed += 1

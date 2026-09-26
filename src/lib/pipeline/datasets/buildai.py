@@ -37,7 +37,7 @@ class BuildAIDatasetAdapter(BaseDatasetAdapter):
 
         start_factory_id = int(dataset_cfg["start_factory_id"])
         end_factory_id = int(dataset_cfg["end_factory_id"])
-        buildai_repo_root = Path(paths_cfg.get("buildai_repo_root", "/root/buildai_processing"))
+        buildai_repo_root = Path(paths_cfg.get("buildai_repo_root", "/path/to/buildai_processing"))
         buildai_config = paths_cfg.get("buildai_config")
         preprocess_cmd = [
             runtimes_cfg.get("buildai_shell", "/bin/bash"),

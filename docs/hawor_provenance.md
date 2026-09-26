@@ -60,5 +60,5 @@ EgoSmith's own modules — including the performance work decoupled out of the H
 - `src/lib/stage_runners/` — per-video stage runners (the demo-fork detect/slam/motion/infiller drivers).
 - everything else under `src/lib/`, `scripts/`, `configs/`, `docs/` — the EgoSmith pipeline, orchestration, exporters, filtering, and entrypoints.
 
-The HaWoR model checkpoints and `model_config.yaml` (see README "Weights") are likewise
+The HaWoR model checkpoints and `model_config.yaml` (fetched by `scripts/setup/download_weights.sh`, see README "Installation") are likewise
 CC-BY-NC-ND and obtained separately.

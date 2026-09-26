@@ -154,7 +154,7 @@ def resolve_tmp_root(args=None, *, required: bool = True) -> Optional[str]:
             "Frame materialization can write many GB, so this is never defaulted "
             "and must point at a large-capacity disk. Set one of (highest priority "
             "first): --stage3_tmp_root, $HAWOR_STAGE3_TMP_ROOT, or $HAWOR_BATCH_TMPDIR, "
-            "e.g. `export HAWOR_BATCH_TMPDIR=/efs-exp/<user>/tmp`."
+            "e.g. `export HAWOR_BATCH_TMPDIR=/path/to/scratch/tmp`."
         )
     tmp_root = os.path.abspath(os.path.expanduser(tmp_root))
     os.makedirs(tmp_root, exist_ok=True)

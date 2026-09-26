@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Analyze batch inference run results and generate report.
-Usage: python scripts/inspection/analyze_run.py <run_dir>
+Usage: python scripts/analyze_run.py <run_dir>
 """
 import argparse
 import json

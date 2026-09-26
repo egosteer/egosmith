@@ -3,7 +3,7 @@
 Runnable entrypoints for EgoSmith — CLIs only; first-party library code lives under `src/lib/`.
 Run from the repo root (`python scripts/<...>.py`); each bootstraps `src/` onto `sys.path`, or do
 `pip install -e .` once. Layout: the main pipeline entrypoints sit at the top level; everything else
-is grouped into `setup/`, `build/`, and `inspection/`.
+is grouped into `setup/` and `build/`.
 
 ## Top level — pipeline entrypoints
 
@@ -13,6 +13,10 @@ is grouped into `setup/`, `build/`, and `inspection/`.
 | `batch_infer.py` | Multi-GPU batch inference over a `--video_list` (detect_track / motion / slam / infiller). |
 | `batch_worker.py` | Per-GPU worker subprocess spawned by the batch path (not run directly). |
 | `extract_frames.py` | Extract frames from a video (or `--video_list`) to JPGs. |
+| `validate_pipeline_run.py` | Validate a completed pipeline run and its exported shards. |
+| `check_motion_stage_outputs.py` | Diagnose one clip across camera, world, and WebDataset outputs. |
+| `overlay_hand_cam.py` | Overlay reconstructed hands onto the source video. |
+| `analyze_run.py` | Summarize a batch inference run. |
 
 ## `setup/` — environment & provisioning
 
@@ -31,17 +35,11 @@ is grouped into `setup/`, `build/`, and `inspection/`.
 |---|---|
 | `build/build_vla_from_manifest.py` | Build the final VLA WebDataset from a frozen clip manifest. |
 | `build/filter_manifest_by_quality.py` | Quality-filter a clip manifest. |
+| `build/wds_to_lerobot.py` | Convert built WebDataset shards to a LeRobot v3.0 dataset (RGB + lowdim, no depth). |
+| `build/wds_to_lerobot_batch.py` | Batch-convert many shard roots to LeRobot and verify each output (YAML job list). |
+| `build/lerobot_rehydrate_video.py` | Re-attach video to a labels-only LeRobot dataset from user-extracted source frames. |
 | `build/run_hot3d_native_depth.py` | HOT3D native Any4D depth-only inference (HOT3D adapter). |
 | `build/generate_fpha_world_res.py` | Generate `world_space_res.pth` for FPHA from right-hand skeleton GT (FPHA stage). |
-
-## `inspection/` — validation, visualization, run inspection
-
-| Script | What it does |
-|---|---|
-| `inspection/validate_pipeline_run.py` | Validate a whole-pipeline run (manifest, stage outputs, annotations, shards). |
-| `inspection/check_motion_stage_outputs.py` | Diagnose one clip across cam-space / world-space / WebDataset lowdim. |
-| `inspection/overlay_hand_cam.py` | Overlay the reconstructed hands onto the video via direct K-projection (no aitviewer). |
-| `inspection/analyze_run.py` | Inspect a batch run directory and print a report. |
 
 See the repo [README](../README.md) and [docs/dataset_pipeline.md](../docs/dataset_pipeline.md) for
 end-to-end usage, and [docs/running_at_scale.md](../docs/running_at_scale.md) /

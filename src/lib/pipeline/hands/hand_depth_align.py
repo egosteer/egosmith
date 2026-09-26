@@ -81,7 +81,7 @@ class HandDepthAlignConfig:
         if not self.enable:
             return "off"
         return (f"on:lam{self.lam:g}:sig{self.sigma:g}:db{self.depth_min:g}-{self.depth_max:g}"
-                f":mv{self.min_valid_frames}:mp{self.min_mask_pixels}")
+                f":mv{self.min_valid_frames}:mp{self.min_mask_pixels}:it{self.irls_iters}")
 
 
 def _cam_positions(extrinsics: np.ndarray) -> np.ndarray:

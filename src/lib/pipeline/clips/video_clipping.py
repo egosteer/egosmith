@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import json
+import re
 from types import SimpleNamespace
 from pathlib import Path
 
 from lib.annotation.api_annotation import load_api_keys
-from lib.annotation.api_annotation_with_clip import run_api_video_clipping
+from lib.annotation.api_annotation_with_clip import _safe_stem as _api_safe_stem, run_api_video_clipping
 from lib.clip.heuristic_video_clipper import discover_videos, load_clip_config, run_heuristic_clipping
 
 
@@ -131,6 +132,51 @@ def _redirect_to_clipped_video_folder(
     return original_dataset
 
 
+def _retire_clips_not_in_report(clip_video_root: Path, report: dict, source_root=None) -> list[str]:
+    """Rename (never delete) clip videos under ``clip_video_root`` the current clipping run did not
+    produce to ``<name>.stale``, so the downstream video_folder scan only sees this run's clips.
+
+    A rerun into the same output directory otherwise keeps clips from an earlier result (e.g. a
+    video now cut into 1 segment instead of 2 keeps its old ``_clip001``). Does nothing when any
+    reported clip lacks its ``path``. Clips of a video whose clipping failed this run (e.g. an
+    empty API response) are kept: the failure says nothing about the earlier clips."""
+    current = set()
+    failed = set()  # (clip dir, sanitized stem) of videos whose clipping failed this run
+    source_root_path = Path(source_root).expanduser().resolve() if source_root else None
+    for item in report.get("videos") or []:
+        if item.get("status") == "failed" and item.get("video"):
+            video_path = Path(item["video"]).expanduser().resolve()
+            rel_parent = Path()
+            if source_root_path is not None and video_path.is_relative_to(source_root_path):
+                rel_parent = video_path.relative_to(source_root_path).parent
+            failed.add(((clip_video_root / rel_parent).resolve(), _api_safe_stem(video_path)))
+        for clip in item.get("clips") or []:
+            if not clip.get("path"):
+                return []
+            current.add(Path(clip["path"]).resolve())
+    if not clip_video_root.is_dir():
+        return []
+    retired = []
+    for video in discover_videos(clip_video_root):
+        if video.resolve() in current:
+            continue
+        if any(
+            video.parent.resolve() == clip_dir and re.fullmatch(re.escape(stem) + r"_clip\d+", video.stem)
+            for clip_dir, stem in failed
+        ):
+            continue
+        target = Path(f"{video}.stale")
+        k = 1
+        while target.exists():
+            target = Path(f"{video}.{k}.stale")
+            k += 1
+        video.replace(target)
+        retired.append(str(target))
+    if retired:
+        print(f"[clip] retired {len(retired)} clip(s) not produced by this run (renamed to *.stale)", flush=True)
+    return retired
+
+
 def apply_video_clipping_if_configured(
     *,
     config: dict,
@@ -214,6 +260,11 @@ def apply_video_clipping_if_configured(
             resume=bool(config.get("resume", True)),
             dry_run=bool(clip_cfg.get("dry_run", False)),
             report_out=report_out,
+            **(
+                {"max_api_retries": int(clip_cfg["max_api_retries"])}
+                if clip_cfg.get("max_api_retries") is not None
+                else {}
+            ),
         )
         annotation_cfg["_api_clip_completed"] = True
 
@@ -221,6 +272,7 @@ def apply_video_clipping_if_configured(
         raise RuntimeError(
             f"clip.mode={mode} produced no clips. Check {report_out}."
         )
+    retired_clips = _retire_clips_not_in_report(clip_video_root, report, source_root)
 
     original_dataset = _redirect_to_clipped_video_folder(
         config=config,
@@ -242,6 +294,7 @@ def apply_video_clipping_if_configured(
         "clip_frames_root": str(clip_frames_root),
         "clip_stage_outputs_root": str(clip_stage_outputs_root),
         "report_out": str(report_out),
+        "retired_stale_clips": len(retired_clips),
         "original_dataset": original_dataset,
     }
     (run_dir / "video_clipping_summary.json").write_text(

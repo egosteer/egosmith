@@ -141,7 +141,35 @@ def _run_single_video(video_path: str, stage: str, runtime: WorkerRuntime, descr
     )
 
 
-def _stage_worker_main(gpu: int, worker_slot: int, stage: str, video_queue: mp.Queue, result_queue: mp.Queue, descriptor_map, config: BatchRunConfig):
+# Per-worker "holding" record in shared memory (written synchronously, so it survives a hard crash of
+# the worker): [index of the video being processed, index of the video already taken as the next one].
+_HOLD_NONE = -1      # nothing held
+_HOLD_SENTINEL = -2  # the queue's end-of-work sentinel was taken
+# A wave replaces a worker that died without reporting (segfault / OOM kill) at most this many times
+# per worker slot, so a crash on start-up cannot loop forever.
+RESPAWNS_PER_WORKER_SLOT = 2
+
+
+def _item_index(item) -> int:
+    return _HOLD_SENTINEL if item is None else int(item[0])
+
+
+def _stage_worker_main(gpu: int, worker_slot: int, stage: str, video_queue: mp.Queue, result_queue: mp.Queue, descriptor_map, config: BatchRunConfig, holdings=None, hold_index: int = 0, initial_items=()):
+    """Process ``(index, video_path)`` items from ``video_queue`` until the ``None`` sentinel.
+
+    ``initial_items`` are processed before the queue is read (a replacement worker takes over the
+    video its crashed predecessor had already taken). ``holdings[2*hold_index:2*hold_index+2]``
+    always names the videos this worker holds, so the parent can account for them if it dies."""
+    pending_initial = list(initial_items)
+
+    def _take():
+        return pending_initial.pop(0) if pending_initial else video_queue.get()
+
+    def _hold(current: int, following: int) -> None:
+        if holdings is not None:
+            holdings[2 * hold_index] = current
+            holdings[2 * hold_index + 1] = following
+
     log_path = _worker_log_path(config, stage, gpu, worker_slot)
     os.environ["HAWOR_QUIET"] = "1"
     _configure_worker_env(config)
@@ -160,9 +188,11 @@ def _stage_worker_main(gpu: int, worker_slot: int, stage: str, video_queue: mp.Q
 
             with ThreadPoolExecutor(max_workers=1) as prefetcher:
                 prefetch_future = None
-                video_path = video_queue.get()
+                item = _take()
+                _hold(_HOLD_NONE, _item_index(item))
 
-                while video_path is not None:
+                while item is not None:
+                    video_index, video_path = item
                     prefetched_data = None
                     if prefetch_future is not None:
                         try:
@@ -170,7 +200,9 @@ def _stage_worker_main(gpu: int, worker_slot: int, stage: str, video_queue: mp.Q
                         except Exception:
                             prefetched_data = None
 
-                    next_video = video_queue.get()
+                    next_item = _take()
+                    _hold(int(video_index), _item_index(next_item))
+                    next_video = None if next_item is None else next_item[1]
 
                     next_prefetch_future = None
                     if next_video is not None:
@@ -220,8 +252,9 @@ def _stage_worker_main(gpu: int, worker_slot: int, stage: str, video_queue: mp.Q
                                 "error": str(error),
                             }
                         )
+                    _hold(_HOLD_NONE, _item_index(next_item))
 
-                    video_path = next_video
+                    item = next_item
                     prefetch_future = next_prefetch_future
 
 
@@ -319,54 +352,128 @@ class StageWorkerPool:
         video_queue = mp.Queue()
         result_queue = mp.Queue()
 
-        for video_path in prioritized_videos:
-            video_queue.put(video_path)
+        for video_index, video_path in enumerate(prioritized_videos):
+            video_queue.put((video_index, video_path))
         worker_count_per_gpu = self.config.worker_count_for_stage(stage)
         total_workers = len(self.config.gpus) * worker_count_per_gpu
         for _ in range(total_workers):
             video_queue.put(None)
 
+        holdings = mp.Array("q", [_HOLD_NONE] * (2 * total_workers), lock=False)
+
+        def _start_worker(gpu, worker_slot, hold_index, initial_items=()):
+            holdings[2 * hold_index] = _HOLD_NONE
+            holdings[2 * hold_index + 1] = _HOLD_NONE
+            process = mp.Process(
+                target=_stage_worker_main,
+                args=(gpu, worker_slot, stage, video_queue, result_queue, self.descriptor_map, self.config),
+                kwargs={"holdings": holdings, "hold_index": hold_index, "initial_items": tuple(initial_items)},
+            )
+            process.start()
+            workers.append(process)
+            return process
+
         workers = []
+        slots = []  # one entry per worker slot: its current process
         for gpu in self.config.gpus:
             for worker_slot in range(worker_count_per_gpu):
-                process = mp.Process(
-                    target=_stage_worker_main,
-                    args=(gpu, worker_slot, stage, video_queue, result_queue, self.descriptor_map, self.config),
-                )
-                process.start()
-                workers.append(process)
+                hold_index = len(slots)
+                slots.append({"gpu": gpu, "worker_slot": worker_slot, "hold_index": hold_index,
+                              "process": _start_worker(gpu, worker_slot, hold_index)})
 
         stage_results = {}
+        crash_failed = set()
+        respawns_left = RESPAWNS_PER_WORKER_SLOT * total_workers
         completed = 0
         total = len(prioritized_videos)
         last_result_time = time.monotonic()
         stall_timeout_sec = self.config.wave_stall_timeout_sec
         stalled = False
 
-        while completed < total:
-            try:
-                result = result_queue.get(timeout=1)
-            except Empty:
-                alive_workers = [worker for worker in workers if worker.is_alive()]
-                if not alive_workers:
-                    break
-                if time.monotonic() - last_result_time >= stall_timeout_sec:
-                    print(
-                        f"[wave:{stage}] No worker results for {stall_timeout_sec}s; "
-                        f"terminating {len(alive_workers)} stalled worker(s)."
-                    )
-                    self._stop_workers(alive_workers, force=False)
-                    stalled = True
-                    break
-                continue
-
-            video_path = result["video"]
-            stage_results[video_path] = result["success"]
+        def _fail_video(video_path, gpu, error):
+            nonlocal completed
+            crash_failed.add(video_path)
+            stage_results[video_path] = False
             completed += 1
-            last_result_time = time.monotonic()
-            on_result(result)
+            on_result({"video": video_path, "success": False, "gpu": gpu, "error": error})
 
-        self._join_workers(workers)
+        def _replace_crashed_workers():
+            """A worker that died with a non-zero exit code (segfault, OOM kill) without reporting:
+            fail the video it was processing, hand the video it had already taken to a replacement
+            worker on the same GPU slot (or fail it once the respawn budget is spent)."""
+            nonlocal respawns_left, last_result_time
+            for slot in slots:
+                process = slot["process"]
+                if process is None or process.is_alive() or not process.exitcode:
+                    continue
+                slot["process"] = None
+                gpu, hold_index = slot["gpu"], slot["hold_index"]
+                current, following = holdings[2 * hold_index], holdings[2 * hold_index + 1]
+                print(f"[wave:{stage}] worker gpu={gpu} slot={slot['worker_slot']} died (exit code {process.exitcode}).")
+                if current >= 0 and prioritized_videos[current] not in stage_results:
+                    _fail_video(prioritized_videos[current], gpu, f"worker_crashed (exit code {process.exitcode})")
+                orphan = None
+                if following >= 0 and prioritized_videos[following] not in stage_results:
+                    orphan = (following, prioritized_videos[following])
+                last_result_time = time.monotonic()
+                if following == _HOLD_SENTINEL:
+                    continue  # it had taken its end-of-work sentinel: nothing left for a replacement
+                if orphan is None and completed >= total:
+                    video_queue.cancel_join_thread()  # every video is accounted for; its sentinel stays queued
+                    continue
+                if respawns_left <= 0:
+                    print(f"[wave:{stage}] worker respawn budget spent; not replacing it.")
+                    if orphan is not None:
+                        _fail_video(orphan[1], gpu, "worker_crashed_before_processing (respawn budget spent)")
+                    # the sentinel it never took stays queued: do not wait on the feeder at exit
+                    video_queue.cancel_join_thread()
+                    continue
+                respawns_left -= 1
+                slot["process"] = _start_worker(gpu, slot["worker_slot"], hold_index, [orphan] if orphan else [])
+
+        try:
+            while completed < total:
+                _replace_crashed_workers()
+                if completed >= total:
+                    break
+                try:
+                    result = result_queue.get(timeout=1)
+                except Empty:
+                    _replace_crashed_workers()
+                    alive_workers = [worker for worker in workers if worker.is_alive()]
+                    if not alive_workers:
+                        # Undelivered queue items would make the feeder thread block exit.
+                        video_queue.cancel_join_thread()
+                        break
+                    if time.monotonic() - last_result_time >= stall_timeout_sec:
+                        print(
+                            f"[wave:{stage}] No worker results for {stall_timeout_sec}s; "
+                            f"terminating {len(alive_workers)} stalled worker(s)."
+                        )
+                        self._stop_workers(alive_workers, force=False)
+                        stalled = True
+                        # Terminated workers leave items queued; do not wait on the feeder at exit.
+                        video_queue.cancel_join_thread()
+                        break
+                    continue
+
+                video_path = result["video"]
+                if video_path in crash_failed:
+                    continue  # already failed when its worker died; a late report must not count twice
+                stage_results[video_path] = result["success"]
+                completed += 1
+                last_result_time = time.monotonic()
+                on_result(result)
+
+            self._join_workers(workers)
+        except BaseException:
+            # on_result (state save / event emit) or the join raised: the non-daemon workers
+            # would keep draining the queue and block interpreter exit, so stop them first.
+            # Their queue feeders may hold undelivered items; do not wait on them at exit.
+            video_queue.cancel_join_thread()
+            self._stop_workers(workers, force=False)
+            self._join_workers(workers)
+            raise
 
         missing = [video_path for video_path in prioritized_videos if video_path not in stage_results]
         for video_path in missing:

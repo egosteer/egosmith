@@ -176,6 +176,8 @@ class MultihostStageSpec:
     runtime_key: str
     extra_args: tuple[str, ...]
     worker_count_per_gpu: int
+    # per-stage resume (infer.<section>.resume / CLI); None falls back to the runner's infer_resume
+    resume: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -291,7 +293,7 @@ class MultihostStageQueueRunner:
         if not dispatch_path.exists():
             self._write_dispatch_state(dispatch_path, expected)
             return expected
-        if not self.infer_resume:
+        if not (self.infer_resume if spec.resume is None else spec.resume):
             self._write_dispatch_state(dispatch_path, expected)
             return expected
 

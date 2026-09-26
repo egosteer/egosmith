@@ -22,6 +22,7 @@ source-agnostic). This page lists what you can feed in and how to select it.
     adapter: video_folder
   paths:
     video_root: /path/to/videos
+    final_dataset_root: /path/to/out/webdataset   # required for non-single-video configs
   ```
 
 ## Adapters
@@ -49,12 +50,16 @@ video: /path/to/input.mp4
 # adapter_config: { clip_id: my_clip, frame_ext: .jpg, jpeg_quality: 95 }
 ```
 
+Every non-single-video config must set `paths.final_dataset_root` (where `build` writes the
+WebDataset shards); the orchestrator reads it for every stage selection, including `prepare`.
+
 **Folder of videos**
 ```yaml
 dataset:
   adapter: video_folder
 paths:
   video_root: /path/to/videos
+  final_dataset_root: /path/to/out/webdataset
 adapter_config:
   extract_frames: true        # set false if frames are already extracted
   frame_subdir: extracted_images
@@ -67,6 +72,7 @@ dataset:
   adapter: image_sequence
 paths:
   sequence_root: /path/with/<clip>/*.jpg
+  final_dataset_root: /path/to/out/webdataset
 # adapter_config: { include_dirs: [clipA, clipB] }   # optional allowlist
 ```
 
@@ -91,9 +97,13 @@ clip:
   workers: 4
 ```
 
-After clipping, later stages operate on the clipped videos. `clip.mode: api` also writes the
+After clipping, later stages operate on the clipped videos. Rerunning clipping into the same
+output directory renames clip files the current run did not produce (e.g. a video now cut into
+fewer segments, or one whose API call failed this time) to `*.stale` — never deleted — so they
+are not picked up again. `clip.mode: api` also writes the
 language sidecars, so the separate `annotate` stage is skipped — see
-[annotation.md](annotation.md).
+[annotation.md](annotation.md). When `build.annotation_suffix` is not set, it inherits
+`clip.annotation_suffix`, so `filter` / `build` / `validate` read the sidecars that clipping wrote.
 
 ## Related
 

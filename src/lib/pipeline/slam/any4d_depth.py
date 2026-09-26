@@ -552,8 +552,15 @@ def predict_any4d_depths_from_views(
     checkpoint_path=None,
     resolution_set=None,
     use_amp=None,
-    prediction_view_offset: int = 1,
+    prediction_view_offset: int = 2,
 ):
+    """Depth for ``frame_indices`` from one Any4D forward over ``views``.
+
+    Any4D names its outputs ``pred1..predN`` after the input views (1-based). This module builds
+    views as ``[ref, *frames]``, so ``pred1`` is the reference (discarded) and the targets start at
+    ``pred2``: the default ``prediction_view_offset=2`` matches that layout. Pass 1 only for views
+    that carry no leading reference view.
+    """
     frame_indices = [int(frame_idx) for frame_idx in frame_indices]
     if not frame_indices:
         raise ValueError("[Any4D] frame_indices is empty")

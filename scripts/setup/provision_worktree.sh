@@ -1,6 +1,6 @@
 #!/bin/bash
 # Provision a fresh checkout / worktree with the gitignored runtime dependencies
-# (model weights, MANO assets, Any4D/DPVO checkpoints, the upstream Any4D script)
+# (model weights, MANO assets, Any4D/DPVO checkpoints)
 # by symlinking them from an already-provisioned source tree. Use after `git
 # clone` / `git pull` / `git worktree add` so the pipeline preflight passes.
 #
@@ -67,14 +67,20 @@ missing=0
 
 # Model weights (preflight: detector / hawor ckpt+config / infiller).
 link "weights" || missing=1
-# MANO assets (preflight: _DATA/.../MANO_{RIGHT,LEFT}.pkl).
-link "_DATA" || missing=1
+# MANO assets (preflight: _DATA/.../MANO_{RIGHT,LEFT}.pkl). fetch_hawor_base.sh creates a real
+# _DATA/data directory (mano_mean_params.npz); `ln -sfn` onto an existing directory would only drop a
+# link inside it, so link the two MANO files individually then. A _DATA that is already a symlink
+# (older provisioning) is refreshed as a whole: linking files through it would write into $SRC.
+if [ -d "_DATA" ] && [ ! -L "_DATA" ]; then
+    link "_DATA/data/mano/MANO_RIGHT.pkl" || missing=1
+    link "_DATA/data_left/mano_left/MANO_LEFT.pkl" || missing=1
+else
+    link "_DATA" || missing=1
+fi
 # Any4D dense-depth checkpoint (slam stage) — absolute, overridable via HAWOR_ANY4D_CKPT.
 link_abs "$ANY4D_CKPT" "thirdparty/Any4D/checkpoints/any4d_4v_combined.pth" || missing=1
 # DPVO checkpoint (slam stage) — absolute, overridable via HAWOR_DPVO_CKPT.
 link_abs "$DPVO_CKPT" "thirdparty/DPVO/models/dpvo.pth" || missing=1
-# Upstream Any4D script that provides init_inference_model / sample_inference.
-link "thirdparty/Any4D/scripts/demo_inference.py" || missing=1
 
 echo
 if [ "$missing" -ne 0 ]; then
@@ -84,7 +90,7 @@ fi
 # Stage-3 scratch root is never defaulted (can write many GB). Remind, don't guess.
 if [ -z "${HAWOR_BATCH_TMPDIR:-}${HAWOR_STAGE3_TMP_ROOT:-}" ]; then
     echo "[provision] NOTE: set a large-disk scratch root before running the slam stage, e.g.:"
-    echo "    export HAWOR_BATCH_TMPDIR=/efs-exp/<user>/tmp"
+    echo "    export HAWOR_BATCH_TMPDIR=/path/to/scratch/tmp"
 else
     echo "[provision] scratch root OK: HAWOR_BATCH_TMPDIR=${HAWOR_BATCH_TMPDIR:-} HAWOR_STAGE3_TMP_ROOT=${HAWOR_STAGE3_TMP_ROOT:-}"
 fi

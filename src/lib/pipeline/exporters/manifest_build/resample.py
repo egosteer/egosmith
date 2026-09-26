@@ -134,12 +134,14 @@ def resample_episode_features(
     wrist_positions = resample_linear_sequence(wrist_state[:, :6].cpu().numpy(), target_count, source_fps, target_fps)
     hand_state_resampled = resample_linear_sequence(hand_state.cpu().numpy(), target_count, source_fps, target_fps)
     pred_rot_resampled = resample_axis_angle_batch(pred_rot.float().cpu().numpy(), target_count, source_fps, target_fps)
+    # (2, T, 45) -> (2*15, T, 3): move the joint axis before time so each row is one
+    # joint's own time series, then invert the same permutation after resampling.
     pred_hand_pose_resampled = resample_axis_angle_batch(
-        pred_hand_pose.float().cpu().numpy().reshape(-1, source_count, 3),
+        pred_hand_pose.float().cpu().numpy().reshape(2, source_count, 15, 3).transpose(0, 2, 1, 3).reshape(-1, source_count, 3),
         target_count,
         source_fps,
         target_fps,
-    ).reshape(2, target_count, 45)
+    ).reshape(2, 15, target_count, 3).transpose(0, 2, 1, 3).reshape(2, target_count, 45)
     pred_betas_resampled = resample_linear_sequence(
         pred_betas.float().cpu().numpy().transpose(1, 0, 2),
         target_count,

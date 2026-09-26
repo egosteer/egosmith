@@ -5,6 +5,8 @@ set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$PROJECT_ROOT"
+# Make `import lib...` work without `pip install -e .` (same as the Python entry scripts).
+export PYTHONPATH="$PROJECT_ROOT/src:$PROJECT_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 
 ENV_NAME="egosmith"
 
@@ -123,7 +125,6 @@ import torch
 from lib.pipeline.slam.any4d_depth import resolve_any4d_paths
 
 repo_root, checkpoint_path, resolution, use_amp = resolve_any4d_paths()
-demo_inference = Path(repo_root) / "scripts" / "demo_inference.py"
 print("python:", sys.executable)
 print("torch:", torch.__version__)
 print("cuda_available:", torch.cuda.is_available())
@@ -137,8 +138,6 @@ if not Path(repo_root).is_dir():
     raise SystemExit(f"ERROR: Any4D repo root not found: {repo_root}")
 if not Path(checkpoint_path).is_file():
     raise SystemExit(f"ERROR: Any4D checkpoint not found: {checkpoint_path}")
-if not demo_inference.is_file():
-    raise SystemExit(f"ERROR: Any4D demo_inference.py not found: {demo_inference}")
 PY
 echo ""
 

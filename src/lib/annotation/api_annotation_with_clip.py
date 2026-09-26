@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import random
 import re
@@ -31,6 +32,7 @@ for _p in (str(PROJECT_ROOT / "src"), str(PROJECT_ROOT)):
 
 from lib.annotation.api_annotation import (  # noqa: E402
     DEFAULT_ANNOTATION_SUFFIX,
+    DEFAULT_MAX_API_RETRIES,
     DEFAULT_MODEL,
     DEFAULT_TARGET_FPS,
     clean_json_text,
@@ -51,6 +53,7 @@ DEFAULT_PROMPT_FILE = (
 )
 
 _invalid_log_lock = threading.Lock()
+logger = logging.getLogger(__name__)
 
 
 def get_parser() -> argparse.ArgumentParser:
@@ -69,6 +72,12 @@ def get_parser() -> argparse.ArgumentParser:
     parser.add_argument("--api_keys_file", default=None, help="Optional text file with one API key per line.")
     parser.add_argument("--target_fps", type=float, default=DEFAULT_TARGET_FPS, help="FPS hint sent to the API.")
     parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument(
+        "--max_api_retries",
+        type=int,
+        default=DEFAULT_MAX_API_RETRIES,
+        help="Retries per video after a rate-limited (429) or raising API call before counting it as failed.",
+    )
     parser.add_argument("--max_videos", type=int, default=None)
     parser.add_argument("--min_segment_sec", type=float, default=0.2)
     parser.add_argument("--max_segment_sec", type=float, default=0.0, help="0 disables the maximum.")
@@ -103,11 +112,21 @@ def extract_response_text(response) -> str | None:
         return None
 
 
-def call_qwen_safe(*, api_key: str, model: str, content_list: list[dict[str, Any]]) -> str | None:
+def call_qwen_safe(
+    *,
+    api_key: str,
+    model: str,
+    content_list: list[dict[str, Any]],
+    max_retries: int = DEFAULT_MAX_API_RETRIES,
+) -> str | None:
+    """Call the API, retrying 429s and exceptions with exponential backoff.
+
+    Returns None (the caller's "empty_api_response" failure) once retries are exhausted.
+    """
     from dashscope import MultiModalConversation
 
-    retry_count = 0
-    while True:
+    max_retries = max(0, int(max_retries))
+    for attempt in range(max_retries + 1):
         try:
             response = MultiModalConversation.call(
                 api_key=api_key,
@@ -119,13 +138,29 @@ def call_qwen_safe(*, api_key: str, model: str, content_list: list[dict[str, Any
             )
             if response.status_code == 200:
                 return extract_response_text(response)
-            if response.status_code == 429:
-                time.sleep(random.uniform(2, 4) * (1.1 ** min(retry_count, 10)))
-                retry_count += 1
-                continue
+            if response.status_code != 429:
+                logger.warning(
+                    "DashScope call returned status %s (%s); not retrying",
+                    response.status_code,
+                    getattr(response, "message", ""),
+                )
+                return None
+            reason = "status 429 (rate limited)"
+        except Exception as error:
+            reason = f"{type(error).__name__}: {error}"
+        if attempt >= max_retries:
+            logger.warning("DashScope call failed after %d attempts; last error: %s", attempt + 1, reason)
             return None
-        except Exception:
-            time.sleep(5)
+        delay = min(60.0, random.uniform(2, 4) * (2 ** attempt))
+        logger.warning(
+            "DashScope call failed (attempt %d/%d): %s; retrying in %.1fs",
+            attempt + 1,
+            max_retries + 1,
+            reason,
+            delay,
+        )
+        time.sleep(delay)
+    return None
 
 
 def parse_segments(raw: str) -> list[dict[str, Any]]:
@@ -142,6 +177,30 @@ def parse_segments(raw: str) -> list[dict[str, Any]]:
 
 def _safe_stem(path: Path) -> str:
     return "".join(ch if ch.isalnum() or ch in {"-", "_", "."} else "_" for ch in path.stem).strip("._") or "video"
+
+
+def _check_output_stem_collisions(videos: list[Path], source_root: Path | None) -> None:
+    """Refuse inputs whose clips would share names: clips are named from the sanitized stem only.
+
+    The key is the flattened clip-id prefix (relative parent parts + sanitized stem joined with
+    ``__``, as clip ids and annotation sidecars are named downstream), so ``a/b.mp4`` and
+    ``a__b.mp4`` collide too, not only same-directory stems."""
+    groups: dict[str, list[Path]] = {}
+    for video_path in videos:
+        rel_parent = Path()
+        if source_root is not None and video_path.is_relative_to(source_root):
+            rel_parent = video_path.relative_to(source_root).parent
+        members = groups.setdefault("__".join((*rel_parent.parts, _safe_stem(video_path))), [])
+        if video_path not in members:
+            members.append(video_path)
+    conflicts = [members for members in groups.values() if len(members) > 1]
+    if conflicts:
+        lines = "\n".join("  " + ", ".join(str(path) for path in members) for members in conflicts)
+        raise ValueError(
+            "Input videos would write clips with the same names or clip ids (same file stem after "
+            "sanitizing, or the same id once the relative directory is flattened with '__'); "
+            f"rename them so their clip ids differ:\n{lines}"
+        )
 
 
 def _clip_id_for_output(output_root: Path, clip_path: Path) -> str:
@@ -279,6 +338,7 @@ def process_video(
     keep_low_quality: bool,
     resume: bool,
     dry_run: bool,
+    max_api_retries: int = DEFAULT_MAX_API_RETRIES,
 ) -> dict[str, Any]:
     rel_parent = Path()
     if source_root is not None and video_path.is_relative_to(source_root):
@@ -295,6 +355,7 @@ def process_video(
             {"video": video_url, "fps": float(target_fps)},
             {"text": prompt, "cache_control": {"type": "ephemeral"}},
         ],
+        max_retries=max_api_retries,
     )
     if not response_text:
         _write_invalid_log(annotation_root, video_path, "empty_api_response")
@@ -374,6 +435,7 @@ def run_api_video_clipping(
     resume: bool = True,
     dry_run: bool = False,
     report_out: str | Path | None = None,
+    max_api_retries: int = DEFAULT_MAX_API_RETRIES,
 ) -> dict[str, Any]:
     output_root = Path(output_root).expanduser().resolve()
     annotation_root = Path(annotation_root).expanduser().resolve()
@@ -381,6 +443,7 @@ def run_api_video_clipping(
     annotation_root.mkdir(parents=True, exist_ok=True)
     source_root_path = Path(source_root).expanduser().resolve() if source_root else None
     videos = [Path(path).expanduser().resolve() for path in video_paths]
+    _check_output_stem_collisions(videos, source_root_path)
     prompt = load_prompt(prompt_file)
     if not api_keys and not dry_run:
         raise RuntimeError("No API key provided. Set DASHSCOPE_API_KEY, --api_key, or --api_keys_file.")
@@ -388,29 +451,38 @@ def run_api_video_clipping(
 
     results = []
     with ThreadPoolExecutor(max_workers=max(1, int(workers))) as executor:
-        futures = []
+        futures = {}
         for index, video_path in enumerate(videos):
-            futures.append(
-                executor.submit(
-                    process_video,
-                    video_path=video_path,
-                    source_root=source_root_path,
-                    output_root=output_root,
-                    annotation_root=annotation_root,
-                    annotation_suffix=annotation_suffix,
-                    api_key=api_keys[index % len(api_keys)],
-                    prompt=prompt,
-                    model=model,
-                    target_fps=target_fps,
-                    min_segment_sec=min_segment_sec,
-                    max_segment_sec=max_segment_sec,
-                    keep_low_quality=keep_low_quality,
-                    resume=resume,
-                    dry_run=dry_run,
-                )
+            future = executor.submit(
+                process_video,
+                video_path=video_path,
+                source_root=source_root_path,
+                output_root=output_root,
+                annotation_root=annotation_root,
+                annotation_suffix=annotation_suffix,
+                api_key=api_keys[index % len(api_keys)],
+                prompt=prompt,
+                model=model,
+                target_fps=target_fps,
+                min_segment_sec=min_segment_sec,
+                max_segment_sec=max_segment_sec,
+                keep_low_quality=keep_low_quality,
+                resume=resume,
+                dry_run=dry_run,
+                max_api_retries=max_api_retries,
             )
+            futures[future] = video_path
         for future in tqdm(as_completed(futures), total=len(futures), desc="API clipping"):
-            results.append(future.result())
+            try:
+                results.append(future.result())
+            except Exception as error:
+                # One video's unexpected error (e.g. a segment with "start": null) must not
+                # abort the run while the other paid calls keep going.
+                video_path = futures[future]
+                reason = f"{type(error).__name__}: {error}"
+                logger.warning("API clipping of %s raised: %s", video_path, reason)
+                _write_invalid_log(annotation_root, video_path, reason)
+                results.append({"video": str(video_path), "status": "failed", "error": reason, "clips": []})
 
     kept_clips = sum(len(item.get("clips") or []) for item in results)
     report = {
@@ -459,6 +531,7 @@ def main(argv: list[str] | None = None) -> None:
         resume=args.resume,
         dry_run=args.dry_run,
         report_out=args.report_out,
+        max_api_retries=args.max_api_retries,
     )
     print(json.dumps(report["summary"], ensure_ascii=False, indent=2))
     if report["summary"]["failed_videos"] > 0:

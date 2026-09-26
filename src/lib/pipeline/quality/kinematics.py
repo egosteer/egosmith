@@ -65,8 +65,10 @@ def max_camera_step(extrinsics, valid_mask=None) -> dict:
             "valid_pairs": 0,
         }
 
-    translations = mats[:, :3, 3]
     rotations = mats[:, :3, :3]
+    # Extrinsics are world-to-camera, so the column t is not the camera position;
+    # the camera center in world coordinates is C = -R^T t.
+    translations = camera_centers_from_w2c(mats)
     translation_diffs = np.linalg.norm(translations[1:] - translations[:-1], axis=1)
     rotation_diffs = np.linalg.norm((rotations[1:] - rotations[:-1]).reshape(rotations.shape[0] - 1, -1), axis=1)
 
@@ -100,6 +102,14 @@ def max_camera_step(extrinsics, valid_mask=None) -> dict:
         "rotation_pair_index": rotation_pair_index,
         "valid_pairs": int(valid_indices.size),
     }
+
+
+def camera_centers_from_w2c(extrinsics) -> np.ndarray:
+    """World-space camera centers C = -R^T t of (..., 4, 4) world-to-camera extrinsics."""
+    mats = np.asarray(extrinsics, dtype=np.float32)
+    rot = mats[..., :3, :3]
+    trans = mats[..., :3, 3]
+    return -np.einsum("...ji,...j->...i", rot, trans)
 
 
 def transform_points_world_to_camera(points, extrinsic) -> np.ndarray:
@@ -173,12 +183,16 @@ def _fingers_relative_to_wrist(fingertips, wrist_translation, wrist_rot6d) -> np
     return (rel @ rot).astype(np.float32)
 
 
-def windowed_wrist_camera_extremes(frame_indices, wrist_world, extrinsics, *, past_frames, future_frames):
+def windowed_wrist_camera_extremes(
+    frame_indices, wrist_world, extrinsics, *, past_frames, future_frames, hand_present=None
+):
     """Sliding-window wrist-relative-to-camera extremes (paper Stage-4 chunk level).
 
     For each buffered frame t, transform every in-window wrist position (window
     [frame_idx[t] - past_frames, frame_idx[t] + future_frames]) into frame t's camera frame and
     accumulate per-axis min/max and max-abs over all (t, in-window) pairs.
+
+    hand_present: optional (n, hands) bool mask; wrists of absent hands are ignored.
 
     Returns (axis_min[3], axis_max[3], max_abs); empty input -> zeros.
     """
@@ -187,12 +201,20 @@ def windowed_wrist_camera_extremes(frame_indices, wrist_world, extrinsics, *, pa
         return np.zeros(3, dtype=np.float32), np.zeros(3, dtype=np.float32), 0.0
     idx = np.asarray(frame_indices, dtype=np.int64)
     wrist = np.asarray(wrist_world, dtype=np.float32).reshape(n, -1, 3)
+    if hand_present is None:
+        present = np.ones(wrist.shape[:2], dtype=bool)
+    else:
+        present = np.asarray(hand_present, dtype=bool).reshape(wrist.shape[:2])
+    if not present.any():
+        return np.zeros(3, dtype=np.float32), np.zeros(3, dtype=np.float32), 0.0
     axis_min = np.full(3, np.inf, dtype=np.float64)
     axis_max = np.full(3, -np.inf, dtype=np.float64)
     max_abs = 0.0
     for t in range(n):
         sel = (idx >= idx[t] - int(past_frames)) & (idx <= idx[t] + int(future_frames))
-        window_world = wrist[sel].reshape(-1, 3)
+        window_world = wrist[sel][present[sel]].reshape(-1, 3)
+        if window_world.shape[0] == 0:
+            continue
         mat = np.asarray(extrinsics[t], dtype=np.float32).reshape(4, 4)
         cam = window_world @ mat[:3, :3].T + mat[:3, 3]
         axis_min = np.minimum(axis_min, cam.min(axis=0))

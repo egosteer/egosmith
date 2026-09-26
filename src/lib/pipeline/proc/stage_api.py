@@ -362,7 +362,7 @@ def _run_motion_stage(task, stage_args, config, runtime, frame_source, profiler,
     return {"timing": timing}
 
 
-def _run_slam_stage(task, stage_args, config, runtime, frame_source, start_idx, end_idx):
+def _run_slam_stage(task, stage_args, config, runtime, frame_source, start_idx, end_idx, force=False):
     from lib.pipeline.stages.slam import hawor_slam
 
     metrics = hawor_slam(
@@ -374,6 +374,7 @@ def _run_slam_stage(task, stage_args, config, runtime, frame_source, start_idx, 
         frame_source=frame_source,
         seq_folder=str(task.seq_folder),
         return_timing=True,
+        force=force,
     )
     if isinstance(metrics, dict) and isinstance(metrics.get("timing"), dict):
         return metrics
@@ -417,7 +418,7 @@ def _run_non_detect_stage(stage, task, stage_args, config, runtime, frame_source
     if stage == "motion":
         metrics = _run_motion_stage(task, stage_args, config, runtime, frame_source, profiler, prefetched_data, force, start_idx, end_idx)
     elif stage == "slam":
-        metrics = _run_slam_stage(task, stage_args, config, runtime, frame_source, start_idx, end_idx)
+        metrics = _run_slam_stage(task, stage_args, config, runtime, frame_source, start_idx, end_idx, force)
     elif stage == "infiller":
         metrics = _run_infiller_stage(task, stage_args, runtime, frame_source, prefetched_data, start_idx, end_idx)
     else:
@@ -458,6 +459,12 @@ def run_pipeline_stage(
             "reason": "existing_valid_output",
             "wall_sec": 0.0,
         }
+
+    if force:
+        # Forced re-run (--no-resume): drop this clip's stale 0-byte .{stage}.done marker first so
+        # a failure in this run cannot be read back as "completed" from the previous run's marker.
+        # It is re-created by _finalize_stage_run once the new outputs validate.
+        get_stage_done_marker(task.seq_folder, stage).unlink(missing_ok=True)
 
     _ensure_runtime_for_stage(runtime, stage)
 

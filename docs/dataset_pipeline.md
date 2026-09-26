@@ -4,9 +4,16 @@ This release focuses on the **single-video** path: one input video becomes one s
 WebDataset samples (image, lowdim, MANO, meta, and optional depth payloads).
 
 ```bash
+export HAWOR_BATCH_TMPDIR=/large/disk/tmp   # required: stage-3 scratch root (or HAWOR_STAGE3_TMP_ROOT)
 python scripts/run_dataset_pipeline.py \
   --config configs/dataset_pipeline_single_video.example.yaml
 ```
+
+The `slam` stage needs a large-capacity scratch root and never defaults one: set
+`HAWOR_STAGE3_TMP_ROOT` or `HAWOR_BATCH_TMPDIR` (or `infer.slam.stage3_tmp_root` /
+`infer.common.stage3_tmp_root` in the config). Without it the preflight aborts the run before frame
+extraction. The preflight runs after the optional `clip` step of `prepare`, so a configured
+`clip.mode` (including paid API clipping) runs before these checks.
 
 Minimal config:
 
@@ -41,9 +48,25 @@ ships only the single-video example config (multi-dataset processing configs are
 - `filter`: build-equivalent clip quality control before export
 - `build`: final WebDataset export
 - `validate`: source and dataset checks
+- `lerobot` (optional, opt-in): convert the built WebDataset into a LeRobot v3.0 dataset
+  (`scripts/build/wds_to_lerobot.py`; see [dataset_format.md](dataset_format.md))
 
 Default stages are `prepare,infer,filter,build,validate`. `annotate` is inserted automatically only
-when `annotation.command` is configured. `--stages` can be used for debugging or resume runs.
+when `annotation.command` is configured; `lerobot` never is — add it explicitly
+(`--stages build,validate,lerobot`, or `--stages lerobot` on a finished run). `--stages` can be used
+for debugging or resume runs. When `filter` is not selected but the run directory already holds a
+`clip_manifest.filtered.jsonl` that is not older than the prepared state (and no earlier stage runs
+in the same invocation), the downstream stages use that filtered state, so clips the filter dropped
+are not exported again. If prepare or infer was rerun after the last filter, the old filtered state
+is not reused (a warning says so) and the unfiltered state is exported: add `filter` to `--stages`.
+
+When `prepare` runs a `clip.mode`, the redirect to the clipped videos (adapter, clip/frame/annotation
+roots) is saved to `<run_dir>/clip_redirect.json`; later invocations without `prepare` restore it, so
+`--stages build,validate` still reads the clip annotations. Changing the `clip` block or the source
+adapter settings afterwards is an error until `prepare` runs again.
+
+For native-feature sources (e.g. `hot3d_wds`), `filter.stages` / `validation.stages` default to
+`native_features` (plus `native_depth` when `infer.native_depth.enabled`) unless set explicitly.
 
 ## Config Shape
 
@@ -53,16 +76,42 @@ First-party configs use the simplified single-video layout:
 video: /path/to/input.mp4
 output_root: /optional/output_root
 
-# Optional annotation hook. Without it, instruction/language fields are allowed to be empty.
+# Optional annotation hook. Instruction/language fields may be empty with or without it (see Notes).
 annotation:
   command: >
     echo "Read {prepared_state} and write annotations to {annotation_root}"
 ```
 
+Optional LeRobot export (only used when `lerobot` is in `--stages`; every key is forwarded to
+`scripts/build/wds_to_lerobot.py`, `output_dir` defaults to `<output_root>/lerobot`, `fps` to
+`build.target_fps`, which for the single-video config defaults to the video's fps; a non-integer
+rate such as 29.97 is an error, not rounded, so set `lerobot.fps` explicitly):
+
+```yaml
+lerobot:
+  hand_frame: world         # world | camera
+  state_layout: egosteer74  # egosteer74 | hawor48
+  task_source: dataset_name  # default: tasks[0] = dataset name; the sentences stay in instructions/language
+  validate: true            # structural checks + no-depth guard after conversion
+  # source_map: /path/to/source_map.parquet   # optional per-frame original-media mapping
+```
+
+`wds_dir`, `descriptor_manifest`, `validate_only` and `overwrite` are reserved and rejected
+in the config. Resume precedence is the same as for the infer and build stages: `--resume`/`--no-resume`
+on the CLI, else `lerobot.resume`, else the top-level `resume`. With resume off, an existing non-empty output
+directory is an error: the orchestrator never overwrites it, so point `lerobot.output_dir` at a
+new directory or empty the old one by hand.
+
 Notes:
 
-- The simplified `video:` config takes no runtime paths; stages run in the active `egosmith` env
-  (see "Runtime" below).
+- The simplified `video:` config takes no runtime paths: its top-level keys are `video`, `output_root`,
+  `run_tag`, `resume`, `annotation`, `clip`, `build`, `filter`, `validation`, `infer`,
+  `adapter_config` and `lerobot`, and a `paths:` or `runtimes:` block is rejected. Stages run in the
+  active `egosmith` env (see "Runtime" below).
+- In a `video:` config, instruction/language fields may stay empty even when `annotation.command` is
+  set: `build.require_annotation` defaults to `false` and `validation.allow_empty_instruction` to
+  `true`, so a clip without a usable sidecar is still exported and validated. Set
+  `build.require_annotation: true` and `validation.allow_empty_instruction: false` to enforce annotations.
 - `annotation.command` receives `{prepared_state}`, `{active_prepared_state}`, `{annotation_root}`,
   `{run_dir}`, `{hawor_python}`, `{slam_python}`, and `{project_root}`.
 
@@ -72,9 +121,11 @@ See [configs/README.md](../configs/README.md) for the config inventory.
 
 EgoSmith runs in a single conda env (`egosmith`). Stage subprocesses use the orchestrator's own
 interpreter (`sys.executable`), so **activate the env first** (`conda activate egosmith`, or
-`pip install -e .`). You can override the interpreter per runtime in the config
-(`runtimes.hawor_python` / `runtimes.slam_python`) — this is mainly how the multihost path points
-each remote host's stages at that host's env. Validate the setup from the repo root:
+`pip install -e .`). Nested (`dataset:` / `paths:`) configs can override the interpreter per runtime
+(`runtimes.hawor_python` / `runtimes.slam_python`); the single-video `video:` config rejects a
+`runtimes` block. Multihost runs set each remote host's interpreters in its
+`infer.multihost.hosts[]` entry (`hawor_python` / `slam_python`; `infer.multihost.hawor_python` /
+`slam_python` set them for every host, and `runtimes.*` is the fallback). Validate the setup from the repo root:
 
 ```bash
 bash scripts/setup/validate_setup.sh
@@ -83,8 +134,9 @@ bash scripts/setup/validate_setup.sh
 ## Quality Control (the `filter` stage)
 
 The `filter` stage applies multi-level quality control (`src/lib/pipeline/quality/quality_metrics.py`). Hard
-rules are always enabled: any `NaN/Inf` lowdim frame, or any missing / empty / mismatched
-instruction frame, drops the whole episode. On top of that:
+rules: any `NaN/Inf` or otherwise invalid lowdim frame (rot6d / extrinsic / intrinsic) always drops the
+whole episode; a missing / empty / mismatched instruction frame drops it only when
+`build.require_annotation: true` (default `false`). On top of that:
 
 - **Frame level** — per-frame motion caps: camera translation `≤ 0.20 m`, wrist/finger translation
   `≤ 0.30 m`, camera rotation `≈ 28°`, and wrist rotation `≈ 41°` (rotations are Frobenius-norm caps
@@ -119,14 +171,22 @@ python scripts/run_dataset_pipeline.py \
   --stages validate
 ```
 
-Or directly:
+Or directly (`--descriptor_manifest` is required: the run's filtered state
+`<output_root>/runs/<run_tag>/clip_manifest.filtered.jsonl`, or `clip_manifest.jsonl` if `filter` did not run):
 
 ```bash
-python scripts/inspection/validate_pipeline_run.py \
-  --dataset_dir /path/to/final_dataset \
+python scripts/validate_pipeline_run.py \
+  --descriptor_manifest /path/to/output_root/runs/run/clip_manifest.filtered.jsonl \
+  --dataset_dir /path/to/output_root/webdataset \
   --max_clips 200 \
-  --dataset_sample_checks 20
+  --dataset_sample_checks 20 \
+  --allow_empty_instruction
 ```
+
+The script's own defaults are stricter than the orchestrator's: `--allow_empty_instruction` and
+`--require_depth` default to off, whereas the orchestrator passes the config's `validation.*`
+values (for a `video:` config, empty instructions allowed and depth required). Pass
+`--allow_empty_instruction` for an unannotated run as above, and `--require_depth` to check depth.
 
 Recommended smoke pass before a large run:
 
@@ -141,10 +201,17 @@ Recommended smoke pass before a large run:
 
 ```bash
 # overlay the reconstructed hands back onto the video, via direct K-projection
-python scripts/inspection/overlay_hand_cam.py --seq_folder /path/to/output_root/.../<clip>
+python scripts/overlay_hand_cam.py --seq_folder /path/to/output_root/stage_outputs/<clip_id> \
+  --frames_dir /path/to/output_root/frames/<clip_id>
 # inspect a batch run directory and print a report
-python scripts/inspection/analyze_run.py /path/to/run_dir
+python scripts/analyze_run.py /path/to/run_dir
 ```
+
+`overlay_hand_cam.py` reads the poses (`result.npz`, or a legacy `world_space_res.pth`) and the SLAM
+export from `--seq_folder`, and the frames as `*.jpg` from `--frames_dir` (default
+`<seq_folder>/extracted_images/`, which only the `demo.py` / `extract_frames.py` layout has; an
+orchestrated run keeps its frames under the adapter's frames root, `<output_root>/frames/<clip_id>/`
+for a `video:` config). A hand is drawn only on frames where it is marked valid.
 
 **End-to-end single-video reconstruction + hand overlay** (`demo.py`). It runs detect → motion →
 SLAM → infiller on one video and overlays the reconstructed hands back onto each frame with OpenCV

@@ -15,7 +15,7 @@ __all__ = [
 
 def __getattr__(name):
     if name in __all__:
-        from . import stage_api
+        from .proc import stage_api
 
         value = getattr(stage_api, name)
         globals()[name] = value

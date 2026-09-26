@@ -8,6 +8,7 @@ from .constants import LEFT_ROOT_ROT6D_SLICE, LOWDIM_SIZE, RIGHT_ROOT_ROT6D_SLIC
 from .kinematics import (
     _abs_axis_metrics,
     _fingers_relative_to_wrist,
+    camera_centers_from_w2c,
     camera_space_abs_metrics,
     camera_space_axis_metrics,
     windowed_wrist_camera_extremes,
@@ -55,6 +56,7 @@ def new_clip_quality_stats(
         "_camera_step_count": 0,
         "max_camera_space_wrist_abs": 0.0,
         "max_camera_space_hand_abs": 0.0,
+        "camera_space_hand_frames": 0,
         "visible_left_frames": 0,
         "visible_right_frames": 0,
         "visible_left_any_point_inframe_frames": 0,
@@ -75,6 +77,7 @@ def new_clip_quality_stats(
         "_seq_frame_idx": [],
         "_seq_wrist_world": [],
         "_seq_extrinsic": [],
+        "_seq_hand_present": [],
         "_visible_left_out_of_frame_streak": 0,
         "_visible_right_out_of_frame_streak": 0,
         "_prev_frame_idx": None,
@@ -84,6 +87,8 @@ def new_clip_quality_stats(
         "_prev_right_fingers": None,
         "_prev_left_rot": None,
         "_prev_right_rot": None,
+        "_prev_left_visible": False,
+        "_prev_right_visible": False,
         "_prev_extrinsic": None,
         "_prev_finite": False,
     }
@@ -184,14 +189,13 @@ def update_clip_quality_stats(
     intrinsic = parts["intrinsic"]
 
     if compute_camera_space_metrics:
-        wrist_camera_metrics = camera_space_abs_metrics(
-            np.stack([current_left, current_right], axis=0),
-            current_extrinsic,
-        )
-        wrist_axis_metrics = camera_space_axis_metrics(
-            np.stack([current_left, current_right], axis=0),
-            current_extrinsic,
-        )
+        # Only hands flagged present contribute camera-space extents, so an absent hand's
+        # placeholder pose (e.g. a never-observed hand) is ignored. Note that presence comes
+        # from the post-infill validity, so frames the infiller filled still count as present.
+        hand_present = np.array([bool(int(presence) & 1), bool(int(presence) & 2)], dtype=bool)
+        present_wrists = np.stack([current_left, current_right], axis=0)[hand_present]
+        wrist_camera_metrics = camera_space_abs_metrics(present_wrists, current_extrinsic)
+        wrist_axis_metrics = camera_space_axis_metrics(present_wrists, current_extrinsic)
         if stats["_chunk_window_enabled"]:
             # Buffer the per-frame wrist (world) + camera extrinsic so finalize can compute the
             # sliding-window wrist-relative-to-camera extremes (paper Stage-4 chunk level).
@@ -200,6 +204,7 @@ def update_clip_quality_stats(
                 np.stack([current_left, current_right], axis=0).astype(np.float32)
             )
             stats["_seq_extrinsic"].append(np.asarray(current_extrinsic, dtype=np.float32).reshape(4, 4))
+            stats["_seq_hand_present"].append(hand_present)
         # Finger joints relative to the wrist (paper Stage-4 chunk level), not relative to camera.
         left_finger_wrist = _fingers_relative_to_wrist(
             left_fingertips, current_left, lowdim_array[LEFT_ROOT_ROT6D_SLICE]
@@ -208,32 +213,38 @@ def update_clip_quality_stats(
             right_fingertips, current_right, lowdim_array[RIGHT_ROOT_ROT6D_SLICE]
         )
         hand_camera_metrics, hand_axis_metrics = _abs_axis_metrics(
-            np.concatenate([left_finger_wrist, right_finger_wrist], axis=0)
+            np.concatenate(
+                [points for points, present in zip((left_finger_wrist, right_finger_wrist), hand_present) if present]
+                or [np.zeros((0, 3), dtype=np.float32)],
+                axis=0,
+            )
         )
-        stats["max_camera_space_wrist_abs"] = max(
-            stats["max_camera_space_wrist_abs"],
-            wrist_camera_metrics["max_abs"],
-        )
-        stats["max_camera_space_hand_abs"] = max(
-            stats["max_camera_space_hand_abs"],
-            hand_camera_metrics["max_abs"],
-        )
-        stats["_camera_space_wrist_min"] = np.minimum(
-            stats["_camera_space_wrist_min"],
-            np.asarray([wrist_axis_metrics["min_x"], wrist_axis_metrics["min_y"], wrist_axis_metrics["min_z"]], dtype=np.float32),
-        )
-        stats["_camera_space_wrist_max"] = np.maximum(
-            stats["_camera_space_wrist_max"],
-            np.asarray([wrist_axis_metrics["max_x"], wrist_axis_metrics["max_y"], wrist_axis_metrics["max_z"]], dtype=np.float32),
-        )
-        stats["_camera_space_hand_min"] = np.minimum(
-            stats["_camera_space_hand_min"],
-            np.asarray([hand_axis_metrics["min_x"], hand_axis_metrics["min_y"], hand_axis_metrics["min_z"]], dtype=np.float32),
-        )
-        stats["_camera_space_hand_max"] = np.maximum(
-            stats["_camera_space_hand_max"],
-            np.asarray([hand_axis_metrics["max_x"], hand_axis_metrics["max_y"], hand_axis_metrics["max_z"]], dtype=np.float32),
-        )
+        if hand_present.any():
+            stats["camera_space_hand_frames"] += 1
+            stats["max_camera_space_wrist_abs"] = max(
+                stats["max_camera_space_wrist_abs"],
+                wrist_camera_metrics["max_abs"],
+            )
+            stats["max_camera_space_hand_abs"] = max(
+                stats["max_camera_space_hand_abs"],
+                hand_camera_metrics["max_abs"],
+            )
+            stats["_camera_space_wrist_min"] = np.minimum(
+                stats["_camera_space_wrist_min"],
+                np.asarray([wrist_axis_metrics["min_x"], wrist_axis_metrics["min_y"], wrist_axis_metrics["min_z"]], dtype=np.float32),
+            )
+            stats["_camera_space_wrist_max"] = np.maximum(
+                stats["_camera_space_wrist_max"],
+                np.asarray([wrist_axis_metrics["max_x"], wrist_axis_metrics["max_y"], wrist_axis_metrics["max_z"]], dtype=np.float32),
+            )
+            stats["_camera_space_hand_min"] = np.minimum(
+                stats["_camera_space_hand_min"],
+                np.asarray([hand_axis_metrics["min_x"], hand_axis_metrics["min_y"], hand_axis_metrics["min_z"]], dtype=np.float32),
+            )
+            stats["_camera_space_hand_max"] = np.maximum(
+                stats["_camera_space_hand_max"],
+                np.asarray([hand_axis_metrics["max_x"], hand_axis_metrics["max_y"], hand_axis_metrics["max_z"]], dtype=np.float32),
+            )
 
     if image_size is not None:
         left_visible = bool(int(presence) & 1)
@@ -280,43 +291,58 @@ def update_clip_quality_stats(
         prev_idx = stats["_prev_frame_idx"]
         curr_left_rot = _rot6d_to_rotmat(lowdim_array[LEFT_ROOT_ROT6D_SLICE])
         curr_right_rot = _rot6d_to_rotmat(lowdim_array[RIGHT_ROOT_ROT6D_SLICE])
+        left_visible = bool(int(presence) & 1)
+        right_visible = bool(int(presence) & 2)
         if stats["_prev_finite"] and prev_idx is not None:
             frame_gap = max(1, int(frame_idx) - int(prev_idx))
-            left_step = float(np.linalg.norm(current_left - stats["_prev_left"]) / frame_gap)
-            right_step = float(np.linalg.norm(current_right - stats["_prev_right"]) / frame_gap)
-            # Per-fingertip displacement; take the largest fingertip step across both hands.
-            left_finger_step = float(
-                np.linalg.norm(left_fingertips - stats["_prev_left_fingers"], axis=1).max() / frame_gap
-            )
-            right_finger_step = float(
-                np.linalg.norm(right_fingertips - stats["_prev_right_fingers"], axis=1).max() / frame_gap
-            )
             prev_rot = stats["_prev_extrinsic"][:3, :3]
-            prev_trans = stats["_prev_extrinsic"][:3, 3]
             curr_rot = current_extrinsic[:3, :3]
-            curr_trans = current_extrinsic[:3, 3]
+            # Camera displacement is measured between world-space camera centers
+            # (C = -R^T t of the world-to-camera extrinsic), not the raw t column.
+            prev_trans = camera_centers_from_w2c(stats["_prev_extrinsic"])
+            curr_trans = camera_centers_from_w2c(current_extrinsic)
             camera_translation_step = float(np.linalg.norm(curr_trans - prev_trans) / frame_gap)
             camera_rotation_step = float(np.linalg.norm((curr_rot - prev_rot).reshape(-1)) / frame_gap)
+
+            # Hand/finger/wrist steps are scored only across frame pairs where that
+            # hand is visible in BOTH frames. Hand-absent segments hold infilled
+            # (synthetic) poses that downstream consumers mask via the presence
+            # flags, so their jumps must not veto the clip; a visibility gap also
+            # never bridges into a fake "step" when the hand re-appears.
+            hand_steps = []
+            finger_steps = []
             # Wrist (root) rotation step: Frobenius norm of the per-frame root-rotation delta, max
             # over both hands. Same metric family as camera_rotation_step, so the threshold maps the
             # same way (||R1-R2||_F = 2*sqrt(2)*sin(theta/2)); paper cap is 41 deg/frame (~0.99).
-            left_wrist_rotation_step = float(
-                np.linalg.norm((curr_left_rot - stats["_prev_left_rot"]).reshape(-1)) / frame_gap
-            )
-            right_wrist_rotation_step = float(
-                np.linalg.norm((curr_right_rot - stats["_prev_right_rot"]).reshape(-1)) / frame_gap
-            )
+            wrist_rotation_steps = []
+            if left_visible and stats["_prev_left_visible"]:
+                hand_steps.append(float(np.linalg.norm(current_left - stats["_prev_left"]) / frame_gap))
+                # Per-fingertip displacement; take the largest fingertip step.
+                finger_steps.append(
+                    float(np.linalg.norm(left_fingertips - stats["_prev_left_fingers"], axis=1).max() / frame_gap)
+                )
+                wrist_rotation_steps.append(
+                    float(np.linalg.norm((curr_left_rot - stats["_prev_left_rot"]).reshape(-1)) / frame_gap)
+                )
+            if right_visible and stats["_prev_right_visible"]:
+                hand_steps.append(float(np.linalg.norm(current_right - stats["_prev_right"]) / frame_gap))
+                finger_steps.append(
+                    float(np.linalg.norm(right_fingertips - stats["_prev_right_fingers"], axis=1).max() / frame_gap)
+                )
+                wrist_rotation_steps.append(
+                    float(np.linalg.norm((curr_right_rot - stats["_prev_right_rot"]).reshape(-1)) / frame_gap)
+                )
 
-            stats["max_hand_translation_step"] = max(
-                stats["max_hand_translation_step"],
-                left_step,
-                right_step,
-            )
-            stats["max_finger_translation_step"] = max(
-                stats["max_finger_translation_step"],
-                left_finger_step,
-                right_finger_step,
-            )
+            if hand_steps:
+                stats["max_hand_translation_step"] = max(
+                    stats["max_hand_translation_step"],
+                    *hand_steps,
+                )
+            if finger_steps:
+                stats["max_finger_translation_step"] = max(
+                    stats["max_finger_translation_step"],
+                    *finger_steps,
+                )
             stats["max_camera_translation_step"] = max(
                 stats["max_camera_translation_step"],
                 camera_translation_step,
@@ -325,11 +351,11 @@ def update_clip_quality_stats(
                 stats["max_camera_rotation_step"],
                 camera_rotation_step,
             )
-            stats["max_wrist_rotation_step"] = max(
-                stats["max_wrist_rotation_step"],
-                left_wrist_rotation_step,
-                right_wrist_rotation_step,
-            )
+            if wrist_rotation_steps:
+                stats["max_wrist_rotation_step"] = max(
+                    stats["max_wrist_rotation_step"],
+                    *wrist_rotation_steps,
+                )
             # Episode-level camera-motion accumulators (mean per-frame magnitude -> dataset IQR).
             stats["_camera_translation_step_sum"] += camera_translation_step
             stats["_camera_rotation_step_sum"] += camera_rotation_step
@@ -342,6 +368,8 @@ def update_clip_quality_stats(
         stats["_prev_right_fingers"] = right_fingertips
         stats["_prev_left_rot"] = curr_left_rot
         stats["_prev_right_rot"] = curr_right_rot
+        stats["_prev_left_visible"] = left_visible
+        stats["_prev_right_visible"] = right_visible
         stats["_prev_extrinsic"] = current_extrinsic
         stats["_prev_finite"] = True
     else:
@@ -352,6 +380,8 @@ def update_clip_quality_stats(
         stats["_prev_right_fingers"] = None
         stats["_prev_left_rot"] = None
         stats["_prev_right_rot"] = None
+        stats["_prev_left_visible"] = False
+        stats["_prev_right_visible"] = False
         stats["_prev_extrinsic"] = None
         stats["_prev_finite"] = False
 
@@ -397,6 +427,7 @@ def finalize_clip_quality_metrics(stats: dict) -> dict:
         ),
         "max_camera_space_wrist_abs": float(stats["max_camera_space_wrist_abs"]),
         "max_camera_space_hand_abs": float(stats["max_camera_space_hand_abs"]),
+        "camera_space_hand_frames": int(stats.get("camera_space_hand_frames", 0)),
         "visible_left_frames": int(stats["visible_left_frames"]),
         "visible_right_frames": int(stats["visible_right_frames"]),
         "visible_left_any_point_inframe_ratio": (
@@ -446,6 +477,7 @@ def finalize_clip_quality_metrics(stats: dict) -> dict:
             stats["_seq_extrinsic"],
             past_frames=stats["_chunk_window_past_frames"],
             future_frames=stats["_chunk_window_future_frames"],
+            hand_present=stats.get("_seq_hand_present") or None,
         )
         metrics["max_camera_space_wrist_abs"] = float(max_abs)
         metrics["min_camera_space_wrist_x"] = float(axis_min[0])

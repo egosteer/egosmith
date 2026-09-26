@@ -5,12 +5,18 @@
 #
 # This script is idempotent -- re-run it to resume a half-finished install.
 #
+# Slow link to PyPI / pytorch.org? Point the install at mirrors:
+#   PYPI_MIRROR=<simple index url>        serves everything that lives on PyPI
+#   TORCH_WHEEL_MIRROR=<root url>         serves the torch wheels from <root>/cu128 (otherwise download.pytorch.org)
+#
 set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$PROJECT_ROOT"
 
 ENV_NAME="egosmith"
+
+if [ -n "${PYPI_MIRROR:-}" ]; then export PIP_INDEX_URL="$PYPI_MIRROR"; fi
 
 log()  { echo -e "\n=== $* ==="; }
 have_conda() { command -v conda >/dev/null 2>&1; }
@@ -58,7 +64,16 @@ install_egosmith() {
     # (These need a custom --index-url, so they can't live in a plain requirements
     # file alongside PyPI packages.) xformers 0.0.32.post2 matches torch 2.8.0.
     log "Installing CUDA-specific torch stack"
-    $R pip install --index-url https://download.pytorch.org/whl/cu128 \
+    # By default the pytorch index serves the whole stack, PyPI-hosted dependencies
+    # included. With a PyPI mirror it only has to supply the +cu128 wheels (a local
+    # version outranks the plain PyPI release, so they still win).
+    local torch_src=(--index-url https://download.pytorch.org/whl/cu128)
+    if [ -n "${TORCH_WHEEL_MIRROR:-}" ]; then
+        torch_src=(--find-links "${TORCH_WHEEL_MIRROR%/}/cu128")
+    elif [ -n "${PYPI_MIRROR:-}" ]; then
+        torch_src=(--extra-index-url https://download.pytorch.org/whl/cu128)
+    fi
+    $R pip install "${torch_src[@]}" \
         --find-links https://data.pyg.org/whl/torch-2.8.0+cu128.html \
         torch==2.8.0 torchvision==0.23.* torchaudio==2.8.* xformers==0.0.32.post2 torch-scatter
     ensure_chumpy

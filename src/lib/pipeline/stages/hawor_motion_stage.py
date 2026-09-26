@@ -308,8 +308,9 @@ def _prepare_track_inference_inputs(track):
     first_non_zero = non_zero_indices[0]
     last_non_zero = non_zero_indices[-1]
 
-    boxes[first_non_zero:last_non_zero + 1] = interpolate_bboxes(boxes[first_non_zero:last_non_zero + 1])
-    velocity_valid = validate_motion_velocity(boxes[first_non_zero:last_non_zero + 1])
+    track_frames = np.array([item["frame"] for item in track])[first_non_zero:last_non_zero + 1]
+    boxes[first_non_zero:last_non_zero + 1] = interpolate_bboxes(boxes[first_non_zero:last_non_zero + 1], frames=track_frames)
+    velocity_valid = validate_motion_velocity(boxes[first_non_zero:last_non_zero + 1], frames=track_frames)
     valid[first_non_zero:last_non_zero + 1] = velocity_valid
 
     slice_valid = valid[first_non_zero:last_non_zero + 1]
@@ -429,6 +430,7 @@ def _process_hand_track(args, idx, track, context, profiler=None):
         num_workers=getattr(args, "num_workers", 16),
         output_device=context.device,
         return_perf=True,
+        chunk_boundaries=chunk_boundaries,
     )
     if profiler:
         print(f"[PROFILER] Step after inference (track {idx})")

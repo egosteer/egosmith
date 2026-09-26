@@ -15,6 +15,12 @@ def load_yaml(path: str | Path) -> dict:
         return yaml.safe_load(handle) or {}
 
 
+# Child-CLI options that take ONE comma-separated string (argparse type=str, no nargs):
+# batch_infer/run_hot3d_native_depth --gpus, build/filter --mano_gpus, wds_to_lerobot --split_order.
+# A YAML list for these must be joined, not expanded into several argv tokens.
+COMMA_JOINED_LIST_KEYS = {"gpus", "mano_gpus", "split_order"}
+
+
 def cli_args_from_mapping(mapping: dict | None, *, negative_bool_flags: set[str] | None = None) -> list[str]:
     args = []
     negative_bool_flags = negative_bool_flags or set()
@@ -27,6 +33,9 @@ def cli_args_from_mapping(mapping: dict | None, *, negative_bool_flags: set[str]
                 args.append(flag)
             elif key in negative_bool_flags:
                 args.append(f"--no-{key}")
+            continue
+        if isinstance(value, list) and key in COMMA_JOINED_LIST_KEYS:
+            args.extend([flag, ",".join(str(item) for item in value)])
             continue
         if isinstance(value, list):
             args.append(flag)

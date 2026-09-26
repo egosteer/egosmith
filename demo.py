@@ -4,7 +4,7 @@ Single-video reconstruction + visualization for EgoSmith — works on any headle
 
 Runs detect -> motion -> SLAM -> infiller on one video, then overlays the reconstructed world-space
 hands back onto each frame with OpenCV (a direct pinhole K-projection — no OpenGL / pyrender /
-aitviewer) and writes an mp4. This is the same projection as scripts/inspection/overlay_hand_cam.py
+aitviewer) and writes an mp4. This is the same projection as scripts/overlay_hand_cam.py
 (which works from a finished run); demo.py just runs the whole pipeline first.
 
 Reads pre-extracted frames, so run `python scripts/extract_frames.py --video_path <video>` first.
@@ -39,7 +39,7 @@ from lib.stage_runners.hawor_video import hawor_infiller, hawor_motion_estimatio
 def project_to_image(vertices, R_w2c, t_w2c, focal, cx, cy):
     """World verts (N,3) -> (N,3) of (u, v, depth) via the SLAM camera + pinhole K.
 
-    Matches scripts/inspection/overlay_hand_cam.py: a plain pinhole projection using the SLAM-recorded
+    Matches scripts/overlay_hand_cam.py: a plain pinhole projection using the SLAM-recorded
     focal and principal point (img_focal / img_center) — not an image-center approximation.
     """
     cam = vertices @ R_w2c.T + t_w2c
@@ -47,6 +47,18 @@ def project_to_image(vertices, R_w2c, t_w2c, focal, cx, cy):
     u = focal * cam[:, 0] / z + cx
     v = focal * cam[:, 1] / z + cy
     return np.stack([u, v, cam[:, 2]], axis=1)
+
+
+def drop_unobserved_hand(verts, hand_valid):
+    """Return ``verts`` (T, V, 3), or an empty (T, 0, 3) array if the hand has no valid frame.
+
+    A hand never observed in the rendered window comes back from the infiller as all-zero
+    MANO parameters marked invalid; rendering it would draw a flat "ghost" hand at the world
+    origin, so it is skipped instead. Hands with any valid frame are returned unchanged.
+    """
+    if np.asarray(hand_valid).astype(bool).any():
+        return verts
+    return np.zeros((verts.shape[0], 0, 3), dtype=verts.dtype)
 
 
 def render_frame(vertices_left, vertices_right, faces_left, faces_right, bg_image,
@@ -76,8 +88,13 @@ def render_frame(vertices_left, vertices_right, faces_left, faces_right, bg_imag
 
 def render_overlay_video(left_verts, right_verts, faces_left, faces_right,
                          frame_source, frame_indices, R_w2c, t_w2c, focal, cx, cy,
-                         output_path, fps=30):
-    """Overlay the world-space hands onto each video frame through the SLAM camera."""
+                         output_path, fps=30, left_valid=None, right_valid=None):
+    """Overlay the world-space hands onto each video frame through the SLAM camera.
+
+    ``left_valid`` / ``right_valid`` (optional, per rendered frame): a hand is skipped on
+    frames where it is invalid (e.g. gap frames the infiller did not fill hold all-zero MANO
+    parameters that would otherwise draw a flat hand at the world origin).
+    """
     print("Rendering hand overlay...")
     first_img = frame_source.get_frame(int(frame_indices[0]), rgb=False)
     height, width = first_img.shape[:2]
@@ -87,8 +104,10 @@ def render_overlay_video(left_verts, right_verts, faces_left, faces_right,
 
     for frame_idx in tqdm(range(left_verts.shape[0]), desc="Rendering frames"):
         bg_img = frame_source.get_frame(int(frame_indices[frame_idx]), rgb=True)
+        left_frame = left_verts[frame_idx] if left_valid is None or left_valid[frame_idx] else None
+        right_frame = right_verts[frame_idx] if right_valid is None or right_valid[frame_idx] else None
         frame = render_frame(
-            left_verts[frame_idx], right_verts[frame_idx],
+            left_frame, right_frame,
             faces_left, faces_right, bg_img,
             R_w2c[frame_idx], t_w2c[frame_idx], focal, cx, cy,
         )
@@ -129,16 +148,17 @@ def main():
     focal = float(cam_npz["img_focal"])
     cx, cy = (float(v) for v in cam_npz["img_center"])
 
-    pred_trans, pred_rot, pred_hand_pose, pred_betas, _pred_valid = hawor_infiller(
+    pred_trans, pred_rot, pred_hand_pose, pred_betas, pred_valid = hawor_infiller(
         args, start_idx, end_idx, frame_chunks_all
     )
 
     print("\n=== Preparing hand meshes ===")
     vis_start = 0
-    vis_end = pred_trans.shape[1] - 1
+    # vis_end is an exclusive bound (used in slices / np.arange below).
+    vis_end = pred_trans.shape[1]
     if args.max_frames is not None:
-        vis_end = min(vis_start + args.max_frames - 1, vis_end)
-        print(f"Limiting visualization to first {args.max_frames} frames (0 to {vis_end})")
+        vis_end = min(vis_start + args.max_frames, vis_end)
+        print(f"Limiting visualization to first {args.max_frames} frames (0 to {vis_end - 1})")
 
     faces = get_mano_faces()
     faces_new = np.array([[92, 38, 234], [234, 38, 239], [38, 122, 239],
@@ -160,8 +180,11 @@ def main():
         pred_hand_pose[0:1, vis_start:vis_end], betas=pred_betas[0:1, vis_start:vis_end],
     )
     left_verts = pred_glob_l["vertices"][0].cpu().numpy()
+    # Skip a hand that has no valid frame in the window (otherwise an origin "ghost" hand).
+    right_verts = drop_unobserved_hand(right_verts, np.asarray(pred_valid)[1, vis_start:vis_end])
+    left_verts = drop_unobserved_hand(left_verts, np.asarray(pred_valid)[0, vis_start:vis_end])
 
-    output_dir = Path(seq_folder) / f"demo_overlay_{vis_start}_{vis_end}"
+    output_dir = Path(seq_folder) / f"demo_overlay_{vis_start}_{vis_end - 1}"
     output_dir.mkdir(parents=True, exist_ok=True)
     output_video = output_dir / "visualization.mp4"
     frame_indices = np.arange(vis_start, vis_end, dtype=np.int64)
@@ -172,6 +195,8 @@ def main():
         frame_source, frame_indices,
         R_w2c_all[vis_start:vis_end], t_w2c_all[vis_start:vis_end],
         focal, cx, cy, output_video, fps=args.fps,
+        left_valid=np.asarray(pred_valid)[0, vis_start:vis_end].astype(bool),
+        right_valid=np.asarray(pred_valid)[1, vis_start:vis_end].astype(bool),
     )
 
     print(f"\n✓ Done! Video saved to: {output_video}")

@@ -22,6 +22,13 @@ def _gmof(x, sigma=100):
     return (sigma_squared * x_squared) / (sigma_squared + x_squared)
 
 
+def _valid_slam_depth(slam_depth):
+    """Pixels carrying a real SLAM depth (finite and positive). DPVO's rasterized
+    disparity maps are sparse: untouched cells are disp=0, i.e. depth=inf, and
+    must be excluded from every median / BFGS statistic."""
+    return np.isfinite(slam_depth) & (slam_depth > 0)
+
+
 def est_scale_hybrid_gpu(slam_depth, pred_depth, sigma=0.5, msk=None, near_thresh=0,
                          far_thresh=10):
     """GPU variant of HaWoR's est_scale.est_scale_hybrid (single keyframe).
@@ -38,20 +45,23 @@ def est_scale_hybrid_gpu(slam_depth, pred_depth, sigma=0.5, msk=None, near_thres
         msk = cv2.resize(msk, (pred_depth.shape[1], pred_depth.shape[0]))
 
     # Stage 1: Iterative steps
+    # Sparse SLAM backends (DPVO) leave pixels with no measurement as disp=0 -> depth=inf;
+    # those must never enter the statistics.
+    slam_valid = _valid_slam_depth(slam_depth)
     s = pred_depth / slam_depth
 
-    robust = (msk < 0.5) * (near_thresh < pred_depth) * (pred_depth < far_thresh)
+    robust = slam_valid * (msk < 0.5) * (near_thresh < pred_depth) * (pred_depth < far_thresh)
     s_est = s[robust]
     scale = np.median(s_est)
 
     for _ in range(10):
         slam_depth_0 = slam_depth * scale
-        robust = (msk < 0.5) * (0 < slam_depth_0) * (slam_depth_0 < far_thresh) * (near_thresh < pred_depth) * (pred_depth < far_thresh)
+        robust = slam_valid * (msk < 0.5) * (0 < slam_depth_0) * (slam_depth_0 < far_thresh) * (near_thresh < pred_depth) * (pred_depth < far_thresh)
         s_est = s[robust]
         scale = np.median(s_est)
 
     # Stage 2: Robust optimization on GPU
-    robust = (msk < 0.5) * (0 < slam_depth_0) * (slam_depth_0 < far_thresh) * (near_thresh < pred_depth) * (pred_depth < far_thresh)
+    robust = slam_valid * (msk < 0.5) * (0 < slam_depth_0) * (slam_depth_0 < far_thresh) * (near_thresh < pred_depth) * (pred_depth < far_thresh)
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     pm = torch.from_numpy(pred_depth[robust]).to(device)
     sm = torch.from_numpy(slam_depth[robust]).to(device)
@@ -95,9 +105,10 @@ def est_scale_hybrid_batch(slam_depths, pred_depths, sigma=0.5, masks=None,
         else:
             msk = np.zeros_like(pred_depth)
 
+        slam_valid = _valid_slam_depth(slam_depth)
         s = pred_depth / slam_depth
         nt, ft = near_thresh, far_thresh
-        robust = (msk < 0.5) * (nt < pred_depth) * (pred_depth < ft)
+        robust = slam_valid * (msk < 0.5) * (nt < pred_depth) * (pred_depth < ft)
         s_est = s[robust]
         if s_est.size == 0:
             init_scales.append(float('nan'))
@@ -108,13 +119,13 @@ def est_scale_hybrid_batch(slam_depths, pred_depths, sigma=0.5, masks=None,
 
         for _ in range(10):
             slam_depth_0 = slam_depth * scale
-            robust = (msk < 0.5) * (0 < slam_depth_0) * (slam_depth_0 < ft) * (nt < pred_depth) * (pred_depth < ft)
+            robust = slam_valid * (msk < 0.5) * (0 < slam_depth_0) * (slam_depth_0 < ft) * (nt < pred_depth) * (pred_depth < ft)
             s_est = s[robust]
             if s_est.size == 0:
                 break
             scale = np.median(s_est)
 
-        robust = (msk < 0.5) * (0 < slam_depth_0) * (slam_depth_0 < ft) * (nt < pred_depth) * (pred_depth < ft)
+        robust = slam_valid * (msk < 0.5) * (0 < slam_depth_0) * (slam_depth_0 < ft) * (nt < pred_depth) * (pred_depth < ft)
         sm_filtered = slam_depth[robust]
         pm_filtered = pred_depth[robust]
 

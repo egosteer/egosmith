@@ -85,6 +85,9 @@ def resolve_auto_quality_thresholds(clip_metrics: list[dict], criteria: dict) ->
     axis_abs_cap = criteria.get("camera_space_axis_abs_cap", 1.5)
 
     candidate_metrics = [metrics for metrics in clip_metrics if metrics["frames_kept_candidate"] > 0]
+    # Camera-space hand distributions only use clips with at least one present-hand frame;
+    # clips without one report placeholder zeros that are not measurements.
+    hand_space_metrics = [metrics for metrics in candidate_metrics if metrics.get("camera_space_hand_frames", 1) > 0]
     use_manual_abs = (
         resolved["max_camera_space_wrist_abs"] is not None
         or resolved["max_camera_space_hand_abs"] is not None
@@ -126,8 +129,8 @@ def resolve_auto_quality_thresholds(clip_metrics: list[dict], criteria: dict) ->
         summaries["episode_camera_rotation"] = cam_rot_summary
 
     if not use_manual_abs and auto_method == "iqr_bounds":
-        wrist_bounds, wrist_distributions = _camera_space_bound_metrics("wrist", candidate_metrics, iqr_multiplier)
-        hand_bounds, hand_distributions = _camera_space_bound_metrics("hand", candidate_metrics, iqr_multiplier)
+        wrist_bounds, wrist_distributions = _camera_space_bound_metrics("wrist", hand_space_metrics, iqr_multiplier)
+        hand_bounds, hand_distributions = _camera_space_bound_metrics("hand", hand_space_metrics, iqr_multiplier)
         cap_bounds = _camera_space_axis_abs_cap_bounds(axis_abs_cap)
         resolved["camera_space_wrist_bounds"] = _merge_camera_space_bounds(wrist_bounds, cap_bounds)
         resolved["camera_space_hand_bounds"] = _merge_camera_space_bounds(hand_bounds, cap_bounds)
@@ -141,8 +144,8 @@ def resolve_auto_quality_thresholds(clip_metrics: list[dict], criteria: dict) ->
                 "upper": float(axis_abs_cap),
             }
     else:
-        wrist_values = [metrics["max_camera_space_wrist_abs"] for metrics in candidate_metrics]
-        hand_values = [metrics["max_camera_space_hand_abs"] for metrics in candidate_metrics]
+        wrist_values = [metrics["max_camera_space_wrist_abs"] for metrics in hand_space_metrics]
+        hand_values = [metrics["max_camera_space_hand_abs"] for metrics in hand_space_metrics]
         wrist_summary = summarize_metric_distribution(wrist_values)
         hand_summary = summarize_metric_distribution(hand_values)
         if wrist_summary is not None:

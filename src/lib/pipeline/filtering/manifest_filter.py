@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 from collections import Counter
+from concurrent.futures import ProcessPoolExecutor
 from multiprocessing import current_process, get_context
 from pathlib import Path
 
@@ -439,10 +440,14 @@ def run_filter(args) -> dict:
         ]
     else:
         mp_context = get_context("spawn") if mano_device_obj.type == "cuda" else get_context()
-        with mp_context.Pool(worker_count, initializer=worker_init, initargs=(config,)) as pool:
+        # ProcessPoolExecutor (not multiprocessing.Pool): a worker killed by the OOM killer raises
+        # BrokenProcessPool instead of leaving imap waiting forever on the lost task.
+        with ProcessPoolExecutor(
+            max_workers=worker_count, mp_context=mp_context, initializer=worker_init, initargs=(config,)
+        ) as pool:
             results = list(
                 tqdm(
-                    pool.imap(worker_eval, enumerate(records), chunksize=int(args.chunksize)),
+                    pool.map(worker_eval, enumerate(records), chunksize=int(args.chunksize)),
                     total=len(records),
                     desc="Filter manifest",
                 )

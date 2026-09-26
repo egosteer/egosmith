@@ -137,6 +137,8 @@ def build_batch_infer_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--legacy-seq-folder",
+        # Alias so config-driven infer.common.legacy_seq_folder (emitted as --legacy_seq_folder) parses.
+        "--legacy_seq_folder",
         dest="legacy_seq_folder",
         action="store_true",
         default=False,

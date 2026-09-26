@@ -175,7 +175,10 @@ def load_pose_arrays(world_res_path):
     legacy ``.pth`` or its containing seq folder.
     """
     p = Path(world_res_path)
-    seq_folder = p.parent if p.suffix else p
+    # Decide file-vs-folder by the known artifact extensions, not by "has any suffix":
+    # seq folders are named after clip ids, which may legitimately contain dots.
+    is_file_path = p.suffix in (".pth", ".npz") and not p.is_dir()
+    seq_folder = p.parent if is_file_path else p
     rp = result_path(seq_folder)
     if rp.is_file():
         with np.load(rp, allow_pickle=True) as data:
@@ -183,7 +186,7 @@ def load_pose_arrays(world_res_path):
     # Legacy fallback.
     import joblib
 
-    legacy = p if p.suffix == ".pth" else (seq_folder / "world_space_res.pth")
+    legacy = p if (is_file_path and p.suffix == ".pth") else (seq_folder / "world_space_res.pth")
     return list(joblib.load(legacy))
 
 

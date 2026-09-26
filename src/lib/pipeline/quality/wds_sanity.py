@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+import re
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -93,6 +94,12 @@ def clip_id_from_sample(sample: dict, meta: dict | None) -> str:
     return sample["key"].rsplit("_f", 1)[0]
 
 
+def sample_episode_key(sample: dict) -> str | None:
+    """Episode part of a ``<episode>_f<frame>`` key; tells repeated episodes of one clip apart."""
+    match = re.match(r"^(?P<episode>.+)_f\d+$", str(sample["key"]))
+    return match.group("episode") if match else None
+
+
 def missing_sample_fields(sample: dict) -> list[str]:
     missing = []
     for field_name in ("image_bytes", "lowdim_bytes", "meta_bytes"):
@@ -124,6 +131,7 @@ class EpisodeAccumulator:
     clip_id: str
     shard_name: str
     buffer_images: bool = False
+    episode_key: str | None = None  # key-derived episode (e.g. ``<clip>__rep1``); None if the key has no ``_f<frame>``
     frames_total: int = 0
     issue_reasons: set[str] = field(default_factory=set)
     instruction_preview: str = ""
@@ -339,7 +347,8 @@ def render_episode_video(
     if first is None:
         return None
     height, width = first.shape[:2]
-    output_path = output_root / f"{episode.clip_id}.mp4"
+    repeated = bool(episode.episode_key) and episode.episode_key.startswith(f"{episode.clip_id}__rep")
+    output_path = output_root / f"{episode.episode_key if repeated else episode.clip_id}.mp4"
     writer = cv2.VideoWriter(str(output_path), cv2.VideoWriter_fourcc(*"mp4v"), float(fps), (width, height))
     if not writer.isOpened():
         raise RuntimeError(f"Failed to open video writer: {output_path}")
@@ -456,14 +465,15 @@ def analyze_webdataset(
                         )
 
                 clip_id = clip_id_from_sample(sample, meta)
-                if current_episode is None or current_episode.clip_id != clip_id:
+                episode_key = sample_episode_key(sample)
+                if current_episode is None or current_episode.clip_id != clip_id or current_episode.episode_key != episode_key:
                     if flush_episode():
                         break
                     buffer_images = bool(render_dir) and (
                         len(problematic_render_candidates) < max(0, render_episodes)
                         or len(clean_render_candidates) < max(0, render_episodes)
                     )
-                    current_episode = EpisodeAccumulator(clip_id=clip_id, shard_name=shard_name, buffer_images=buffer_images)
+                    current_episode = EpisodeAccumulator(clip_id=clip_id, shard_name=shard_name, buffer_images=buffer_images, episode_key=episode_key)
 
                 current_episode.frames_total += 1
                 try:

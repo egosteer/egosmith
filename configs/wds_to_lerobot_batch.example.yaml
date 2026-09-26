@@ -1,0 +1,201 @@
+# Batch WebDataset -> LeRobot v3.0 conversion + verification, one LeRobot dataset per source dataset.
+#   python scripts/build/wds_to_lerobot_batch.py --config configs/wds_to_lerobot_batch.example.yaml --dry_run
+#
+# Every key under `defaults` can be overridden per job. Paths are absolute on the production machine.
+#
+# release.tier decides what may leave the building (see src/lib/pipeline/exporters/lerobot_release.py):
+#   open         full dataset, redistributable                    (permissive / CC-BY / CC-BY-SA / CC-BY-NC sources)
+#   gated        full dataset behind an access gate               (source itself was gated, or NC terms to acknowledge)
+#   labels_only  no pixels; needs descriptor_manifest for the rehydration index
+#   internal     converted for in-house use only, never distributed
+# The tier classification below follows the licence texts collected on 2026-09-13; re-check before publishing.
+
+report_dir: /data/lerobot/_batch_reports
+
+defaults:
+  fps: 30
+  workers: auto                 # file pairs converted in parallel, each with its own ffmpeg; auto = cpu_count // ffmpeg_threads
+  ffmpeg: ffmpeg
+  resume: true
+  overwrite: false
+  reference_root: /path/to/EgoSteer-RealWorld
+  steps: [convert, release, validate, verify_wds, compare_reference, loader]
+
+  converter:                    # any ConvertConfig field (src/lib/pipeline/exporters/lerobot_export.py)
+    state_layout: egosteer74
+    hand_frame: world
+    pad_value: 0.0
+    task_source: dataset_name   # tasks[0] = dataset name (defaults to the job name); the sentences stay in instructions/language
+    split_order: [train, val]
+    include_mano: true
+    include_extrinsic: true
+    include_presence: true
+    crf: 18
+    gop: 15
+    preset: medium
+    ffmpeg_threads: 4
+    video_files_size_in_mb: 200
+    data_files_size_in_mb: 100
+    robot_type: egosmith_human
+
+  verify:
+    workers: auto               # per-episode / per-frame / per-file checks in parallel; auto = cpu count
+    random_frames: 300
+    full_files: 2
+    full_stride: 1
+    numeric_episodes: all
+    overlay_episodes: 3
+    min_psnr: 30.0
+    seed: 0
+
+  loader:
+    num_items: 64
+    window_state: 16
+    window_action: 32
+
+  release:
+    tier: internal              # safe default: a job without an explicit release block never leaves
+    contact: "EgoSmith data team"
+
+jobs:
+  # ---------------------------------------------------------------- permissive sources -> open
+  - name: egosmith_egoverse
+    wds_dir: /data/egosmith/runs/egoverse/final_dataset
+    output_dir: /data/lerobot/egosmith_egoverse
+    release:
+      tier: open
+      source_name: EgoVerse
+      source_url: https://example.org/egoverse            # fill in
+      license: MIT
+      license_file: /data/licenses/egoverse/LICENSE
+      copyright: "Copyright (c) EgoVerse authors"
+      derived_license: CC-BY-4.0
+
+  - name: egosmith_egodex
+    wds_dir: /data/egosmith/runs/egodex/final_dataset
+    output_dir: /data/lerobot/egosmith_egodex
+    release:
+      tier: open
+      source_name: EgoDex
+      source_url: https://github.com/apple/ml-egodex
+      license: custom                                     # Apple sample-code style licence: modify + redistribute allowed
+      license_url: https://github.com/apple/ml-egodex/blob/main/LICENSE
+      license_file: /data/licenses/egodex/LICENSE
+      copyright: "Copyright (C) 2025 Apple Inc. All Rights Reserved."
+      derived_license: CC-BY-4.0
+      notes: "Apple names/trademarks must not be used to endorse this dataset. Original notice text ships in LICENSES/."
+
+  - name: egosmith_holoassist
+    wds_dir: /data/egosmith/runs/holoassist/final_dataset
+    output_dir: /data/lerobot/egosmith_holoassist
+    release:
+      tier: open
+      source_name: HoloAssist
+      source_url: https://holoassist.github.io/
+      license: CDLA-Permissive-2.0
+      license_file: /data/licenses/holoassist/CDLA-Permissive-2.0.txt
+      derived_license: CC-BY-4.0
+
+  - name: egosmith_egocentric_10k     # HF gated (registration only), Apache-2.0
+    wds_dir: /data/egosmith/runs/egocentric_10k/final_dataset
+    output_dir: /data/lerobot/egosmith_egocentric_10k
+    release:
+      tier: gated                     # courtesy: the source only asks for registration, we do the same
+      source_name: Egocentric-10K
+      source_url: https://huggingface.co/datasets/builddotai/Egocentric-10K   # confirm the exact HF id
+      license: Apache-2.0
+      license_file: /data/licenses/egocentric_10k/LICENSE
+      copyright: "<copyright line from the source repository>"
+      derived_license: CC-BY-4.0
+      notes: "Source gate asks for contact information only; no additional terms."
+
+  - name: egosmith_egocentric_100k    # HF gated (registration only), Apache-2.0
+    wds_dir: /data/egosmith/runs/egocentric_100k/final_dataset
+    output_dir: /data/lerobot/egosmith_egocentric_100k
+    release:
+      tier: gated
+      source_name: Egocentric-100K
+      source_url: https://huggingface.co/datasets/builddotai/Egocentric-100K  # confirm the exact HF id
+      license: Apache-2.0
+      license_file: /data/licenses/egocentric_100k/LICENSE
+      copyright: "<copyright line from the source repository>"
+      derived_license: CC-BY-4.0
+      notes: "Source gate asks for contact information only; no additional terms."
+
+  # ---------------------------------------------------------------- ShareAlike sources -> open, CC-BY-SA
+  - name: egosmith_taco
+    wds_dir: /data/egosmith/runs/taco/final_dataset
+    output_dir: /data/lerobot/egosmith_taco
+    release:
+      tier: open
+      source_name: TACO
+      source_url: https://taco2024.github.io/
+      license: CC-BY-SA-4.0
+      derived_license: CC-BY-SA-4.0
+
+  - name: egosmith_oakink
+    wds_dir: /data/egosmith/runs/oakink/final_dataset
+    output_dir: /data/lerobot/egosmith_oakink
+    release:
+      tier: open
+      source_name: OakInk
+      source_url: https://oakink.net/
+      license: CC-BY-SA-4.0          # re-check the page: older OakInk releases were NC
+      derived_license: CC-BY-SA-4.0
+
+  # ---------------------------------------------------------------- NonCommercial sources
+  - name: egosmith_epic_kitchens
+    wds_dir: /data/egosmith/runs/epic_kitchens/final_dataset
+    output_dir: /data/lerobot/egosmith_epic_kitchens
+    release:
+      tier: open
+      source_name: EPIC-KITCHENS
+      source_url: https://epic-kitchens.github.io/
+      license: CC-BY-NC-4.0
+      derived_license: CC-BY-NC-4.0
+
+  - name: egosmith_hot3d
+    wds_dir: /data/egosmith/runs/hot3d/final_dataset
+    output_dir: /data/lerobot/egosmith_hot3d
+    release:
+      tier: open
+      source_name: HOT3D
+      source_url: https://facebookresearch.github.io/hot3d/
+      license: CC-BY-NC-SA-4.0        # sequence data is CC-BY-SA, but our lowdim/mano come from the NC-SA hand annotations
+      derived_license: CC-BY-NC-SA-4.0
+      uses_native_hand_annotations: true
+      notes: "Hand values derive from HOT3D's own hand annotations (CC-BY-NC-SA); the whole dataset therefore inherits NC-SA."
+
+  # ---------------------------------------------------------------- labels only (no pixels may be redistributed)
+  - name: egosmith_ego4d_labels
+    wds_dir: /data/egosmith/runs/ego4d/final_dataset
+    output_dir: /data/lerobot/egosmith_ego4d_labels
+    descriptor_manifest: /data/egosmith/runs/ego4d/manifests/build_manifest.jsonl   # required: rehydration index
+    release:
+      tier: labels_only
+      source_name: Ego4D
+      source_url: https://ego4d-data.org/
+      license: custom
+      license_url: https://ego4d-data.org/docs/license/
+      license_file: /data/licenses/ego4d/LICENSE.txt
+      derived_license: CC-BY-NC-4.0
+      notes: "Ego4D videos are not redistributed. Users obtain them under the Ego4D licence and rehydrate with meta/source_frames.parquet."
+
+  # ---------------------------------------------------------------- internal only (terms forbid redistribution of any form)
+  - name: egosmith_fpha
+    wds_dir: /data/egosmith/runs/fpha/final_dataset
+    output_dir: /data/lerobot/egosmith_fpha
+    steps: [convert, release, validate, verify_wds, loader]   # no need to diff an internal set against the reference
+    release:
+      tier: internal
+      source_name: FPHA
+      notes: "FPHA terms forbid redistribution or modification, partial or entire. Internal training only."
+
+  - name: egosmith_h2o
+    wds_dir: /data/egosmith/runs/h2o/final_dataset
+    output_dir: /data/lerobot/egosmith_h2o
+    steps: [convert, release, validate, verify_wds, loader]
+    release:
+      tier: internal                 # raise to labels_only only with written permission from ETH Zurich
+      source_name: H2O
+      notes: "ETH terms: academic only, no transfer to third parties. Internal until ETH confirms derived labels may be shared."

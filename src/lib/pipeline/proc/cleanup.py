@@ -59,6 +59,8 @@ _HEAVY_SLAM_GLOBS = (
     "any4d_depth_dpvo_*.npz",
     "any4d_stitch_cf_*.npz",
     "hand_anchor_k_*.npz",
+    "*.npz.stale",    # SLAM caches retired by a digest mismatch or a forced rerun (stages/slam.py)
+    "*.npz.*.stale",
 )
 
 

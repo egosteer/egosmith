@@ -27,7 +27,7 @@ def get_parser() -> argparse.ArgumentParser:
         help=(
             "Resume compatible stages (prepare/infer/build), skipping work that "
             "already produced outputs. Defaults to the config 'resume' value, "
-            "which defaults to disabled. Pass --no-resume to force off."
+            "which defaults to enabled. Pass --no-resume to force off."
         ),
     )
     parser.add_argument(

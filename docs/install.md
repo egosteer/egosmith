@@ -51,8 +51,13 @@ runtime stack is provisioned by `setup_env.sh` / the requirements files.
 - **NumPy** — keep `numpy==1.26.4`. MANO's legacy pickle files still need `chumpy`, so
   `scripts/setup/setup_env.sh` (and the manual `scripts/setup/fetch_chumpy.sh`) materialize a patched install
   copy from `thirdparty/chumpy_upstream` plus `patches/chumpy/setup.py.patch`.
-- **CUDA wheels** — override the wheel index per stack if your driver differs, e.g.
-  `HAWOR_CUDA=cu126 bash scripts/setup/setup_env.sh`.
+- **CUDA wheels** — `scripts/setup/setup_env.sh` always installs the CUDA 12.8 stack (`cuda-toolkit=12.8`
+  and the `cu128` torch / xformers / torch-scatter wheels); its mirror variables (`PYPI_MIRROR`, `TORCH_WHEEL_MIRROR`) change only where wheels come from, not the CUDA version. If your
+  driver needs another CUDA build, edit those versions / index URLs in `scripts/setup/setup_env.sh` or
+  follow the manual install above with the matching wheel index.
+- **`CUDA_HOME`** — DPVO is built with `CUDA_HOME` set to the env's `$CONDA_PREFIX` (the conda
+  `cuda-toolkit`), both by `setup_env.sh` and in the manual steps; a `CUDA_HOME` already exported in your
+  shell is overridden for that build.
 
 ## Troubleshooting
 
@@ -69,7 +74,7 @@ runtime stack is provisioned by `setup_env.sh` / the requirements files.
 ## Reusing an already-provisioned checkout
 
 A fresh clone / `git worktree` can borrow the gitignored runtime deps (weights, MANO, Any4D/DPVO
-checkpoints, the upstream Any4D `demo_inference.py`) from an existing set-up checkout instead of
+checkpoints) from an existing set-up checkout instead of
 re-downloading:
 
 ```bash

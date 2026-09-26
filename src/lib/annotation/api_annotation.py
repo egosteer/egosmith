@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import random
 import re
@@ -37,6 +38,7 @@ from lib.pipeline.io.frame_sources import build_frame_source_from_descriptor  # 
 DEFAULT_MODEL = "qwen3.5-plus"
 DEFAULT_ANNOTATION_SUFFIX = ".annotation.json"
 DEFAULT_TARGET_FPS = 5.0
+DEFAULT_MAX_API_RETRIES = 5
 DEFAULT_PROMPT_FILE = (
     PROJECT_ROOT
     / "src"
@@ -49,6 +51,7 @@ DEFAULT_PROMPT_FILE = (
 
 
 _invalid_log_lock = threading.Lock()
+logger = logging.getLogger(__name__)
 
 
 def get_parser() -> argparse.ArgumentParser:
@@ -96,6 +99,12 @@ def get_parser() -> argparse.ArgumentParser:
         help="FPS used when frame descriptors must be materialized to temporary MP4. Defaults to descriptor FPS or target_fps.",
     )
     parser.add_argument("--workers", type=int, default=4, help="Parallel API workers.")
+    parser.add_argument(
+        "--max_api_retries",
+        type=int,
+        default=DEFAULT_MAX_API_RETRIES,
+        help="Retries per clip after a rate-limited (429) or raising API call before counting it as failed.",
+    )
     parser.add_argument("--max_clips", type=int, default=None, help="Optional clip limit for tests/debugging.")
     parser.add_argument(
         "--clip_ids",
@@ -326,11 +335,21 @@ def extract_response_text(response) -> str | None:
         return None
 
 
-def call_qwen_safe(*, api_key: str, model: str, content_list: list[dict[str, Any]]) -> str | None:
+def call_qwen_safe(
+    *,
+    api_key: str,
+    model: str,
+    content_list: list[dict[str, Any]],
+    max_retries: int = DEFAULT_MAX_API_RETRIES,
+) -> str | None:
+    """Call the API, retrying 429s and exceptions with exponential backoff.
+
+    Returns None (the caller's "empty_api_response" failure) once retries are exhausted.
+    """
     from dashscope import MultiModalConversation
 
-    retry_count = 0
-    while True:
+    max_retries = max(0, int(max_retries))
+    for attempt in range(max_retries + 1):
         try:
             response = MultiModalConversation.call(
                 api_key=api_key,
@@ -342,13 +361,29 @@ def call_qwen_safe(*, api_key: str, model: str, content_list: list[dict[str, Any
             )
             if response.status_code == 200:
                 return extract_response_text(response)
-            if response.status_code == 429:
-                time.sleep(random.uniform(2, 5) * (1.2 ** min(retry_count, 10)))
-                retry_count += 1
-                continue
+            if response.status_code != 429:
+                logger.warning(
+                    "DashScope call returned status %s (%s); not retrying",
+                    response.status_code,
+                    getattr(response, "message", ""),
+                )
+                return None
+            reason = "status 429 (rate limited)"
+        except Exception as error:
+            reason = f"{type(error).__name__}: {error}"
+        if attempt >= max_retries:
+            logger.warning("DashScope call failed after %d attempts; last error: %s", attempt + 1, reason)
             return None
-        except Exception:
-            time.sleep(5)
+        delay = min(60.0, random.uniform(2, 5) * (2 ** attempt))
+        logger.warning(
+            "DashScope call failed (attempt %d/%d): %s; retrying in %.1fs",
+            attempt + 1,
+            max_retries + 1,
+            reason,
+            delay,
+        )
+        time.sleep(delay)
+    return None
 
 
 def write_invalid_log(annotation_root: Path, record: ClipManifestRecord, reason: str) -> None:
@@ -400,6 +435,7 @@ def annotate_one_record(
                 {"video": video_url, "fps": float(args.target_fps)},
                 {"text": prompt, "cache_control": {"type": "ephemeral"}},
             ],
+            max_retries=getattr(args, "max_api_retries", DEFAULT_MAX_API_RETRIES),
         )
 
     if not response_text:
@@ -492,19 +528,26 @@ def main(argv: list[str] | None = None) -> None:
     results = []
     max_workers = max(1, int(args.workers))
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = []
+        futures = {}
         for index, record in enumerate(records):
-            futures.append(
-                executor.submit(
-                    annotate_one_record,
-                    record=record,
-                    api_key=api_keys[index % len(api_keys)],
-                    prompt=prompt,
-                    args=args,
-                )
+            future = executor.submit(
+                annotate_one_record,
+                record=record,
+                api_key=api_keys[index % len(api_keys)],
+                prompt=prompt,
+                args=args,
             )
+            futures[future] = record
         for future in tqdm(as_completed(futures), total=len(futures), desc="Annotating clips"):
-            results.append(future.result())
+            try:
+                results.append(future.result())
+            except Exception as error:
+                # One clip's unexpected error must not abort the run (other paid calls keep going).
+                record = futures[future]
+                reason = f"{type(error).__name__}: {error}"
+                logger.warning("Annotation of clip %s raised: %s", record.clip_id, reason)
+                write_invalid_log(annotation_root, record, reason)
+                results.append({"clip_id": record.clip_id, "status": "failed", "error": reason})
 
     report = summarize_results(results, manifest=args.manifest, annotation_root=args.annotation_root)
     report_path = Path(args.report_out) if args.report_out else annotation_root / "_annotation_report.json"

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 from lib.pipeline.datasets.base import BaseDatasetAdapter, register_dataset_adapter
@@ -11,8 +12,18 @@ from lib.pipeline.datasets.descriptors import ClipDescriptor
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png")
 
 
+def _natural_key(name: str):
+    """Digit-aware sort key (like natsort's default): 2.jpg < 10.jpg; zero-padded names keep lexicographic order."""
+    # re.split with a capture group alternates text/digit chunks, so int and str never meet in a comparison.
+    parts = re.split(r"(\d+)", name)
+    return tuple(int(part) if i % 2 else part for i, part in enumerate(parts)), name
+
+
 def _list_image_names(frame_dir: Path) -> list[str]:
-    return sorted(path.name for path in frame_dir.iterdir() if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS)
+    return sorted(
+        (path.name for path in frame_dir.iterdir() if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS),
+        key=_natural_key,
+    )
 
 
 @register_dataset_adapter

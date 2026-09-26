@@ -13,8 +13,8 @@ Usage:
     # Batch processing
     python scripts/extract_frames.py --video_list videos.txt --num_workers 8
 
-    # Custom output directory and quality
-    python scripts/extract_frames.py --video_path video.mp4 --output_dir ./frames --quality 95
+    # Custom quality (the output directory is always <video_dir>/<video_stem>/extracted_images/)
+    python scripts/extract_frames.py --video_path video.mp4 --quality 95
 """
 
 import argparse
@@ -132,15 +132,15 @@ def extract_frames_decord(
 
 def process_video_worker(args_tuple):
     """Worker function for multiprocessing."""
-    video_path, quality, format, verbose = args_tuple
+    video_path, quality, format, verbose, skip_existing = args_tuple
 
     # Match official format: <video_dir>/<video_stem>/extracted_images/
     video_dir = Path(video_path).parent
     video_stem = Path(video_path).stem
     output_dir = video_dir / video_stem / "extracted_images"
 
-    # Skip if already extracted
-    if os.path.exists(output_dir):
+    # Skip if already extracted (only with --skip_existing, as in the single-worker path)
+    if skip_existing and os.path.exists(output_dir):
         existing_frames = len([f for f in os.listdir(output_dir) if f.endswith(('.jpg', '.png'))])
         if existing_frames > 0:
             if verbose:
@@ -306,7 +306,7 @@ def main():
     else:
         # Multi-threaded processing
         worker_args = [
-            (vp, quality, args.format, not args.quiet)
+            (vp, quality, args.format, not args.quiet, args.skip_existing)
             for vp in valid_paths
         ]
 
